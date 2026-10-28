@@ -1,0 +1,30 @@
+{
+  "name": "lumen",
+  "version": "0.1.0",
+  "description": "A desktop AI code editor powered by Claude, with access to your whole system",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-packager . Lumen --platform=darwin --arch=arm64 --out=dist --overwrite --app-bundle-id=com.lumen.editor --ignore=^/dist"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.3.312",
+    "@anthropic-ai/sdk": "^1.3.0"
+  },
+  "devDependencies": {
+    "@electron/packager": "^20.3.0",
+    "electron": "^45.1.0"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jerry5379/lumen.git"
+  },
+  "keywords": [
+    "claude",
+    "electron",
+    "code-editor",
+    "ai",
+    "claude-code"
+  ]
+}
