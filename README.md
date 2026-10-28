@@ -9,7 +9,12 @@ Sign in with your **claude.ai** account (Pro or Max) and Lumen runs Claude Code 
 - **Ask about any code on your Mac.** "Where do I configure the database in my side project?", "Which of my repos still use React 17?" Claude searches and reads the files it needs. Nothing is uploaded up front.
 - **Edit with review.** Ask for a change and Claude proposes it as a diff. You accept or reject every edit and every shell command before it runs.
 - **Inline rewrites.** Select code, press ⌘K, describe the change and review the diff.
-- **Drag in context.** Drop files or folders from the explorer, the tabs or Finder onto the chat. Small text files are attached in full; larger files and folders are passed as paths for Claude to explore.
+- **Drag and drop like Cursor.**
+  - Drag files or folders from the explorer, the tabs or Finder onto the chat to attach them. Small text files go in full; larger files and folders are passed as paths.
+  - Type `@` in the chat box to attach a file by name.
+  - Drag files between folders in the explorer to move them. Folders spring open when you hover over them.
+  - Drop files from Finder onto the explorer to copy them into the workspace, or onto the editor or tab bar to open them.
+  - Drag tabs to reorder them, and drag the panel edges to resize (double-click an edge to reset).
 - **System chores.** "Free up space in my Downloads", "Why does `npm start` fail in ~/work/api?" Commands always ask for approval first.
 - **Light, dark or system theme**, switchable from the title bar.
 

@@ -207,6 +207,34 @@ ipcMain.handle("fs:read", async (_e, file) => {
   return { path: p, text: buf.toString("utf8") };
 });
 
+// Explorer drag and drop: move inside the workspace, copy in from Finder.
+async function exists(p) { try { await fsp.lstat(p); return true; } catch { return false; } }
+async function dropTarget(from, toDir) {
+  const src = expand(from), dir = expand(toDir);
+  const dest = path.join(dir, path.basename(src));
+  if (dest === src) return { src, dest, same: true };
+  if (dir === src || dir.startsWith(src + path.sep)) throw new Error("Can't move a folder into itself.");
+  if (await exists(dest)) throw new Error(`${path.basename(src)} already exists in ${path.basename(dir)}.`);
+  return { src, dest };
+}
+ipcMain.handle("fs:move", async (_e, { from, toDir }) => {
+  const t = await dropTarget(from, toDir);
+  if (t.same) return t.dest;
+  try { await fsp.rename(t.src, t.dest); }
+  catch (e) {
+    if (e.code !== "EXDEV") throw e;
+    await fsp.cp(t.src, t.dest, { recursive: true, errorOnExist: true, force: false });
+    await fsp.rm(t.src, { recursive: true });
+  }
+  return t.dest;
+});
+ipcMain.handle("fs:copy", async (_e, { from, toDir }) => {
+  const t = await dropTarget(from, toDir);
+  if (t.same) return t.dest;
+  await fsp.cp(t.src, t.dest, { recursive: true, errorOnExist: true, force: false });
+  return t.dest;
+});
+
 ipcMain.handle("fs:write", async (_e, { path: file, text }) => {
   const p = expand(file);
   await fsp.mkdir(path.dirname(p), { recursive: true });

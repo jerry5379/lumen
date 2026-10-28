@@ -33,6 +33,7 @@
       <div class="ws-path" id="wsPath"></div>
       <div id="newFileRow" class="newfile" hidden><input id="newFileInput" placeholder="relative/path/file.ts" aria-label="New file path"></div>
       <div class="tree" id="tree"></div>
+      <div class="resizer" id="resizeLeft" role="separator" aria-orientation="vertical" aria-label="Resize explorer" title="Drag to resize · double-click to reset"></div>
     </aside>
 
     <section class="editor-col" aria-label="Editor">
@@ -85,12 +86,14 @@
         <div class="grow"></div>
         <button class="icon-btn" id="clearChat" type="button" title="New chat" aria-label="New chat"><svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M8 3v10M3 8h10" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button>
       </div>
+      <div class="resizer left" id="resizeRight" role="separator" aria-orientation="vertical" aria-label="Resize chat" title="Drag to resize · double-click to reset"></div>
       <div class="log" id="log"></div>
       <div class="dropzone" id="dropzone" hidden><div>Drop files or folders to attach</div></div>
       <div class="composer">
+        <div class="mention" id="mention" hidden role="listbox" aria-label="Attach a file"></div>
         <div class="ctxbar" id="ctxbar"></div>
         <div class="box">
-          <textarea id="prompt" placeholder="Ask about any file, folder or project on this Mac…" aria-label="Message Claude"></textarea>
+          <textarea id="prompt" placeholder="Ask anything · @ to attach a file · drop files here" aria-label="Message Claude"></textarea>
           <div class="box-foot">
             <select id="model" aria-label="Model"></select>
             <div class="grow"></div>

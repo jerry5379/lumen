@@ -68,8 +68,10 @@ async function renderDir(container, dir, depth) {
     b.style.paddingLeft = (8 + depth * 14) + "px";
     b.dataset.path = en.path;
     b.title = en.path;
+    b.dataset.dir = en.dir ? "1" : "";
     b.draggable = true;
-    b.addEventListener("dragstart", (e) => dragPath(e, en.path, en.dir));
+    b.addEventListener("dragstart", (e) => { dragPath(e, en.path, en.dir); treeDrag = en.path; b.classList.add("dragging"); });
+    b.addEventListener("dragend", () => { treeDrag = null; b.classList.remove("dragging"); clearTreeDrop(); });
     b.innerHTML = en.dir ? `${CHEV}${esc(en.name)}` : `<span style="width:12px"></span><span class="dot" style="background:${DOT[ext(en.name)] || "var(--faint)"}"></span>${esc(en.name)}`;
     container.appendChild(b);
     if (en.dir) {
@@ -120,7 +122,9 @@ function renderTabs() {
     d.className = "tab" + (t.path === state.active ? " active" : "");
     d.title = t.path;
     d.draggable = true;
-    d.addEventListener("dragstart", (e) => dragPath(e, t.path, false));
+    d.dataset.path = t.path;
+    d.addEventListener("dragstart", (e) => { dragPath(e, t.path, false); e.dataTransfer.setData(TAB_DRAG, t.path); d.classList.add("dragging"); });
+    d.addEventListener("dragend", () => { d.classList.remove("dragging"); clearTabDrop(); });
     const dirty = t.text !== t.savedText;
     d.innerHTML = `<span class="dot" style="background:${DOT[ext(t.path)] || "var(--faint)"}"></span><button type="button" class="nm">${esc(base(t.path))}${dirty ? " •" : ""}</button><button type="button" class="x" aria-label="Close"><svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true"><path d="M2 2l6 6M8 2l-6 6" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg></button>`;
     d.querySelector(".nm").onclick = () => activate(t.path);
@@ -547,7 +551,7 @@ function updateSend() {
   sendBtn.disabled = !promptEl.value.trim();
 }
 promptEl.addEventListener("input", () => { promptEl.style.height = "auto"; promptEl.style.height = Math.min(200, promptEl.scrollHeight) + "px"; updateSend(); });
-promptEl.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); if (!state.busy) send(); } });
+promptEl.addEventListener("keydown", (e) => { if (mention.open) return; if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); if (!state.busy) send(); } });
 sendBtn.onclick = () => (state.busy ? api.stop() : send());
 
 let selMemo = null;
@@ -584,6 +588,7 @@ $("ctxbar").addEventListener("click", (e) => {
 
 /* ---------- drag files into the chat ---------- */
 const LUMEN_DRAG = "application/x-lumen-path";
+const TAB_DRAG = "application/x-lumen-tab";
 function dragPath(e, p, dir) {
   e.dataTransfer.setData(LUMEN_DRAG, JSON.stringify({ path: p, dir }));
   e.dataTransfer.setData("text/plain", p);
@@ -631,6 +636,176 @@ document.addEventListener("drop", (e) => e.preventDefault());
     droppedPaths(e.dataTransfer).filter((g) => !g.dir).forEach((g) => openFile(g.path));
   });
 }
+
+/* ---------- explorer drag and drop: move within, copy in from Finder ---------- */
+let treeDrag = null, hoverTimer = null, hoverRow = null;
+const parentOf = (p) => p.slice(0, p.lastIndexOf("/")) || "/";
+const treeEl = $("tree");
+function clearTreeDrop() {
+  treeEl.classList.remove("drop-root");
+  treeEl.querySelectorAll(".drop-into").forEach((r) => r.classList.remove("drop-into"));
+  clearTimeout(hoverTimer); hoverRow = null;
+}
+function treeDropDir(e) {
+  const row = e.target.closest(".row");
+  if (!row) return state.workspace;
+  return row.dataset.dir ? row.dataset.path : parentOf(row.dataset.path);
+}
+function remapPath(from, to) {
+  const fix = (p) => (p === from ? to : p && p.startsWith(from + "/") ? to + p.slice(from.length) : p);
+  state.tabs.forEach((t) => { t.path = fix(t.path); });
+  state.active = fix(state.active);
+  state.attachments.forEach((a) => { a.path = fix(a.path); });
+  state.expanded = new Set([...state.expanded].map(fix));
+}
+treeEl.addEventListener("dragover", (e) => {
+  const own = [...e.dataTransfer.types].includes(LUMEN_DRAG);
+  if (own ? !treeDrag : !isFileDrag(e)) return;   // tabs can't be dropped on the tree
+  e.preventDefault(); e.stopPropagation();
+  e.dataTransfer.dropEffect = treeDrag ? "move" : "copy";
+  const dir = treeDropDir(e);
+  const row = [...treeEl.querySelectorAll(".row")].find((r) => r.dataset.dir && r.dataset.path === dir);
+  if (row === hoverRow && (row || treeEl.classList.contains("drop-root"))) return;
+  clearTreeDrop();
+  if (row) {
+    row.classList.add("drop-into"); hoverRow = row;
+    if (!row.classList.contains("open")) hoverTimer = setTimeout(() => row.click(), 700);  // spring-load folders
+  } else if (dir === state.workspace) treeEl.classList.add("drop-root");
+});
+treeEl.addEventListener("dragleave", (e) => { if (!treeEl.contains(e.relatedTarget)) clearTreeDrop(); });
+treeEl.addEventListener("drop", async (e) => {
+  e.preventDefault(); e.stopPropagation();
+  const dir = treeDropDir(e), moving = treeDrag;
+  clearTreeDrop();
+  const sources = moving ? [{ path: moving }] : droppedPaths(e.dataTransfer);
+  let done = 0;
+  for (const src of sources) {
+    if (parentOf(src.path) === dir) continue;
+    try {
+      const dest = moving ? await api.move(src.path, dir) : await api.copy(src.path, dir);
+      if (moving) remapPath(src.path, dest);
+      done++;
+    } catch (err) { toast(String(err.message || err).replace(/^Error invoking remote method '[^']+': (Error: )?/, "")); }
+  }
+  if (!done) return;
+  state.expanded.add(dir); state.fileIndex = null;
+  await renderTree(); renderTabs(); renderCtx(); markActiveInTree();
+  toast(`${moving ? "Moved" : "Copied"} ${done === 1 ? base(sources[0].path) : done + " items"} to ${base(dir) || "/"}`);
+});
+
+/* ---------- tab bar: reorder by dragging, drop files to open ---------- */
+const tabsEl = $("tabs");
+function clearTabDrop() { tabsEl.querySelectorAll(".drop-before,.drop-after").forEach((t) => t.classList.remove("drop-before", "drop-after")); }
+function tabSlot(e) {
+  const t = e.target.closest(".tab");
+  if (!t) return null;
+  const r = t.getBoundingClientRect();
+  return { el: t, after: e.clientX > r.left + r.width / 2 };
+}
+tabsEl.addEventListener("dragover", (e) => {
+  if (!isFileDrag(e) && ![...e.dataTransfer.types].includes(TAB_DRAG)) return;
+  e.preventDefault(); e.stopPropagation();
+  clearTabDrop();
+  if ([...e.dataTransfer.types].includes(TAB_DRAG)) {
+    e.dataTransfer.dropEffect = "move";
+    const s = tabSlot(e);
+    if (s) s.el.classList.add(s.after ? "drop-after" : "drop-before");
+  } else e.dataTransfer.dropEffect = "copy";
+});
+tabsEl.addEventListener("dragleave", (e) => { if (!tabsEl.contains(e.relatedTarget)) clearTabDrop(); });
+tabsEl.addEventListener("drop", (e) => {
+  e.preventDefault(); e.stopPropagation();
+  clearTabDrop();
+  const moved = e.dataTransfer.getData(TAB_DRAG);
+  if (moved) {
+    const s = tabSlot(e);
+    const from = state.tabs.findIndex((t) => t.path === moved);
+    if (from < 0) return;
+    const [t] = state.tabs.splice(from, 1);
+    let to = state.tabs.length;
+    if (s) { to = state.tabs.findIndex((x) => x.path === s.el.dataset.path); if (to < 0) to = state.tabs.length; else if (s.after) to++; }
+    state.tabs.splice(to, 0, t);
+    renderTabs();
+    return;
+  }
+  droppedPaths(e.dataTransfer).filter((g) => !g.dir).forEach((g) => openFile(g.path));
+});
+
+/* ---------- resizable panels ---------- */
+function setupResizer(id, prop, fromLeft, min, max) {
+  const el = $(id), root = document.querySelector(".main"), key = "lumen." + prop;
+  const apply = (w) => { w = Math.round(Math.max(min, Math.min(max, w, root.clientWidth - 420))); root.style.setProperty(prop, w + "px"); return w; };
+  try { const v = +localStorage.getItem(key); if (v) apply(v); } catch {}
+  el.addEventListener("pointerdown", (e) => {
+    e.preventDefault();
+    el.setPointerCapture(e.pointerId);
+    el.classList.add("dragging"); document.body.classList.add("resizing");
+    const rect = root.getBoundingClientRect();
+    let w = 0;
+    const move = (ev) => { w = apply(fromLeft ? ev.clientX - rect.left : rect.right - ev.clientX); };
+    const up = () => {
+      el.removeEventListener("pointermove", move); el.removeEventListener("pointerup", up);
+      el.classList.remove("dragging"); document.body.classList.remove("resizing");
+      if (w) try { localStorage.setItem(key, w); } catch {}
+    };
+    el.addEventListener("pointermove", move); el.addEventListener("pointerup", up);
+  });
+  el.addEventListener("dblclick", () => { root.style.removeProperty(prop); try { localStorage.removeItem(key); } catch {} });
+}
+setupResizer("resizeLeft", "--left-w", true, 160, 560);
+setupResizer("resizeRight", "--right-w", false, 300, 820);
+
+/* ---------- @ to attach a file ---------- */
+const mentionEl = $("mention");
+const mention = { open: false, list: [], sel: 0 };
+function mentionQuery() {
+  const upto = promptEl.value.slice(0, promptEl.selectionStart);
+  const m = /(^|\s)@([^\s@]*)$/.exec(upto);
+  return m ? { q: m[2], start: upto.length - m[2].length - 1 } : null;
+}
+function closeMention() { mention.open = false; mentionEl.hidden = true; }
+function drawMention() {
+  mentionEl.innerHTML = mention.list.map((p, i) => `<button type="button" class="it${i === mention.sel ? " sel" : ""}" data-i="${i}" role="option"><span class="dot" style="background:${DOT[ext(p)] || "var(--faint)"}"></span>${esc(base(p))}<small>${esc(relPath(p))}</small></button>`).join("") || `<div class="empty">No matching files</div>`;
+  const cur = mentionEl.querySelector(".sel"); if (cur) cur.scrollIntoView({ block: "nearest" });
+}
+async function updateMention() {
+  const mq = mentionQuery();
+  if (!mq) return closeMention();
+  mention.open = true; mentionEl.hidden = false;
+  if (!state.fileIndex) {
+    mentionEl.innerHTML = `<div class="empty">Indexing ${esc(base(state.workspace) || "/")}…</div>`;
+    state.fileIndex = await buildIndex();
+    if (!mentionQuery()) return closeMention();
+  }
+  const q = mentionQuery().q;
+  const open = state.tabs.map((t) => t.path).filter((p) => !q || base(p).toLowerCase().includes(q.toLowerCase()));
+  mention.list = [...new Set([...open, ...fuzzyFiles(q, 60)])].slice(0, 50);
+  mention.sel = 0;
+  drawMention();
+}
+function pickMention(i) {
+  const p = mention.list[i], mq = mentionQuery();
+  if (!p || !mq) return closeMention();
+  const end = promptEl.selectionStart;
+  promptEl.setRangeText("", mq.start, end, "end");
+  attach(p, false);
+  closeMention(); renderCtx(); promptEl.focus();
+  promptEl.dispatchEvent(new Event("input"));
+}
+promptEl.addEventListener("input", updateMention);
+promptEl.addEventListener("keydown", (e) => {
+  if (!mention.open) return;
+  const n = mention.list.length;
+  if (e.key === "ArrowDown" && n) { mention.sel = (mention.sel + 1) % n; drawMention(); }
+  else if (e.key === "ArrowUp" && n) { mention.sel = (mention.sel - 1 + n) % n; drawMention(); }
+  else if ((e.key === "Enter" || e.key === "Tab") && !e.isComposing) pickMention(mention.sel);
+  else if (e.key === "Escape") closeMention();
+  else return;
+  e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation();
+}, true);
+promptEl.addEventListener("blur", () => setTimeout(closeMention, 150));
+mentionEl.addEventListener("mousedown", (e) => e.preventDefault());
+mentionEl.addEventListener("click", (e) => { const b = e.target.closest("[data-i]"); if (b) pickMention(+b.dataset.i); });
 
 async function attachmentContext(list) {
   const parts = [];
@@ -755,6 +930,19 @@ async function buildIndex() {
   }
   return files;
 }
+const relPath = (p) => p.startsWith(state.workspace + "/") ? p.slice(state.workspace.length + 1) : p;
+function fuzzyFiles(query, limit = 200) {
+  const q = query.toLowerCase().replace(/\s+/g, "");
+  const list = [];
+  for (const p of state.fileIndex || []) {
+    const s = relPath(p).toLowerCase(); let i = 0;
+    for (const c of s) if (c === q[i]) i++;
+    if (i === q.length) { list.push(p); if (list.length > limit) break; }
+  }
+  const rank = (p) => { const b = base(p).toLowerCase(); return b.startsWith(q) ? 0 : b.includes(q) ? 1 : 2; };
+  if (q) list.sort((a, b) => rank(a) - rank(b) || base(a).length - base(b).length || a.length - b.length);
+  return list;
+}
 async function openPalette() {
   const ov = document.createElement("div");
   ov.className = "overlay";
@@ -764,17 +952,9 @@ async function openPalette() {
   inp.focus();
   let sel = 0, list = [];
   const close = () => ov.remove();
-  const rel = (p) => p.startsWith(state.workspace + "/") ? p.slice(state.workspace.length + 1) : p;
+  const rel = relPath;
   const draw = () => {
-    const q = inp.value.toLowerCase().replace(/\s+/g, "");
-    const files = state.fileIndex || [];
-    list = [];
-    for (const p of files) {
-      const s = rel(p).toLowerCase(); let i = 0;
-      for (const c of s) if (c === q[i]) i++;
-      if (i === q.length) { list.push(p); if (list.length > 200) break; }
-    }
-    if (q) list.sort((a, b) => (base(a).toLowerCase().includes(q) ? 0 : 1) - (base(b).toLowerCase().includes(q) ? 0 : 1));
+    list = fuzzyFiles(inp.value);
     sel = Math.min(sel, Math.max(0, list.length - 1));
     items.innerHTML = list.slice(0, 100).map((p, i) => `<button type="button" class="it${i === sel ? " sel" : ""}" data-p="${esc(p)}"><span class="dot" style="background:${DOT[ext(p)] || "var(--faint)"}"></span>${esc(base(p))}<small>${esc(rel(p))}</small></button>`).join("") || `<div class="empty">No matching files</div>`;
   };

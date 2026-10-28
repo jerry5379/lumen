@@ -15,6 +15,8 @@ contextBridge.exposeInMainWorld("lumen", {
   stop: () => ipcRenderer.invoke("agent:stop"),
   reset: () => ipcRenderer.invoke("agent:reset"),
   approve: (id, decision) => ipcRenderer.invoke("agent:approve", { id, decision }),
+  move: (from, toDir) => ipcRenderer.invoke("fs:move", { from, toDir }),
+  copy: (from, toDir) => ipcRenderer.invoke("fs:copy", { from, toDir }),
   pathForFile: (file) => webUtils.getPathForFile(file),
   setTheme: (mode) => ipcRenderer.invoke("theme:set", mode),
   inlineEdit: (req) => ipcRenderer.invoke("inline:edit", req),
