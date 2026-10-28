@@ -5,7 +5,7 @@ const fs = require("fs");
 const fsp = require("fs/promises");
 const path = require("path");
 const os = require("os");
-const { spawn } = require("child_process");
+const { spawn, execFileSync } = require("child_process");
 
 // Apps opened from Finder get a minimal PATH; give Claude Code (and its Bash tool) the usual one.
 const NVM_BINS = (() => {
@@ -18,21 +18,58 @@ const NVM_BINS = (() => {
 const EXTRA_PATH = [path.join(os.homedir(), ".local", "bin"), ...NVM_BINS, "/opt/homebrew/bin", "/usr/local/bin"];
 const ENV_PATH = [...EXTRA_PATH, process.env.PATH || "/usr/bin:/bin:/usr/sbin:/sbin"].join(":");
 
-function findClaude() {
-  for (const dir of EXTRA_PATH) {
-    const p = path.join(dir, "claude");
-    if (fs.existsSync(p)) {
-      try { return fs.realpathSync(p); } catch { return p; }
-    }
+// Several copies of Claude Code can be installed (Homebrew, npm, the native installer),
+// and an interrupted update can leave the newest one without its `claude` link.
+// Look everywhere and use the newest version, since old ones are refused by newer models.
+function candidates() {
+  const out = EXTRA_PATH.map((dir) => path.join(dir, "claude"));
+  for (const bin of NVM_BINS) {
+    const pkg = path.join(bin, "..", "lib", "node_modules", "@anthropic-ai", "claude-code");
+    out.push(path.join(pkg, "bin", "claude.exe"), path.join(pkg, "cli.js"));
   }
-  return null;
+  out.push(path.join(os.homedir(), ".claude", "local", "claude"));
+  try {
+    const v = path.join(os.homedir(), ".local", "share", "claude", "versions");
+    for (const f of fs.readdirSync(v)) out.push(path.join(v, f));
+  } catch {}
+  return out;
 }
-const CLAUDE = findClaude();
+function versionOf(p) {
+  try {
+    const out = execFileSync(p, ["--version"], { timeout: 8000, encoding: "utf8", env: { ...process.env, PATH: ENV_PATH } });
+    const m = /(\d+)\.(\d+)\.(\d+)/.exec(out);
+    return m ? m.slice(1).map(Number) : null;
+  } catch { return null; }
+}
+const newer = (a, b) => { for (let i = 0; i < 3; i++) if (a[i] !== b[i]) return a[i] > b[i]; return false; };
+function findClaude() {
+  const seen = new Set();
+  let best = null;
+  for (const c of candidates()) {
+    let real;
+    try { if (!fs.statSync(c).isFile()) continue; real = fs.realpathSync(c); } catch { continue; }
+    if (seen.has(real)) continue;
+    seen.add(real);
+    const v = versionOf(real);
+    if (v && (!best || newer(v, best.v))) best = { path: real, v };
+  }
+  return best ? { path: best.path, version: best.v.join(".") } : null;
+}
+// Re-checked every few minutes so a `claude update` is picked up without restarting Lumen.
+let found = null, foundAt = 0;
+function claude() {
+  if (!found || Date.now() - foundAt > 5 * 60 * 1000 || !fs.existsSync(found.path)) {
+    found = findClaude(); foundAt = Date.now();
+  }
+  return found;
+}
+const claudePath = () => (claude() || {}).path || null;
 
 function runClaude(args) {
   return new Promise((resolve) => {
-    if (!CLAUDE) return resolve({ code: -1, out: "Claude Code isn't installed." });
-    const child = spawn(CLAUDE, args, { env: { ...process.env, PATH: ENV_PATH } });
+    const bin = claudePath();
+    if (!bin) return resolve({ code: -1, out: "Claude Code isn't installed." });
+    const child = spawn(bin, args, { env: { ...process.env, PATH: ENV_PATH } });
     let out = "";
     child.stdout.on("data", (d) => { out += d; });
     child.stderr.on("data", (d) => { out += d; });
@@ -45,9 +82,9 @@ async function authStatus() {
   const r = await runClaude(["auth", "status"]);
   try {
     const j = JSON.parse(r.out.slice(r.out.indexOf("{")));
-    return { installed: !!CLAUDE, loggedIn: !!j.loggedIn, method: j.authMethod || null, email: j.email || null };
+    return { installed: true, version: claude().version, loggedIn: !!j.loggedIn, method: j.authMethod || null, email: j.email || null };
   } catch {
-    return { installed: !!CLAUDE, loggedIn: false, method: null, email: null };
+    return { installed: !!claudePath(), version: (claude() || {}).version || null, loggedIn: false, method: null, email: null };
   }
 }
 const login = () => runClaude(["auth", "login", "--claudeai"]);
@@ -87,7 +124,7 @@ class ClaudeCodeAgent {
 
   baseOptions(signalController) {
     return {
-      pathToClaudeCodeExecutable: CLAUDE,
+      pathToClaudeCodeExecutable: claudePath(),
       cwd: this.getWorkspace(),
       env: { ...process.env, PATH: ENV_PATH },
       abortController: signalController,
@@ -97,7 +134,7 @@ class ClaudeCodeAgent {
   }
 
   async run(userText) {
-    if (!CLAUDE) {
+    if (!claudePath()) {
       this.emit({ type: "error", message: "Claude Code isn't installed. Install it from claude.com/claude-code, then sign in." });
       return;
     }
@@ -117,7 +154,9 @@ class ClaudeCodeAgent {
       ...(this.sessionId ? { resume: this.sessionId } : {}),
     };
 
-    let sawText = false;
+    let sawText = false, failed = false;
+    // One clear error per request: Claude Code can report the same failure several ways.
+    const fail = (message) => { if (!failed) { failed = true; this.emit({ type: "error", message }); } };
     try {
       for await (const msg of query({ prompt: userText, options })) {
         if (msg.session_id) { this.sessionId = msg.session_id; this.sessionCwd = this.getWorkspace(); }
@@ -139,7 +178,7 @@ class ClaudeCodeAgent {
               this.emit({ type: "tool_start", id: b.id, name: b.name, input: summarize(b.name, b.input) });
             }
           }
-          if (msg.error) this.emit({ type: "error", message: assistantError(msg.error) });
+          if (msg.error) fail(assistantError(msg.error, msg.message));
         } else if (msg.type === "user") {
           const content = Array.isArray(msg.message.content) ? msg.message.content : [];
           for (const b of content) {
@@ -153,7 +192,9 @@ class ClaudeCodeAgent {
           }
         } else if (msg.type === "result") {
           if (msg.subtype !== "success") {
-            this.emit({ type: "error", message: resultError(msg) });
+            fail(resultError(msg));
+          } else if (msg.is_error) {
+            fail(explain(String(msg.result || "")) || "Claude Code stopped with an error.");
           } else if (!sawText && msg.result) {
             this.emit({ type: "text", delta: msg.result });
           }
@@ -162,7 +203,7 @@ class ClaudeCodeAgent {
       this.emit({ type: "done" });
     } catch (err) {
       if (signal.aborted) this.emit({ type: "done", stopped: true });
-      else this.emit({ type: "error", message: friendly(err) });
+      else fail(friendly(err));
     } finally {
       this.controller = null;
     }
@@ -204,7 +245,7 @@ class ClaudeCodeAgent {
 
   // ⌘K: one tool-free turn that returns only the replacement code.
   async inlineEdit({ path: file, before, selection, after, instruction }) {
-    if (!CLAUDE) throw new Error("Claude Code isn't installed.");
+    if (!claudePath()) throw new Error("Claude Code isn't installed.");
     const { query } = await sdk();
     const prompt = `Rewrite a snippet of ${file}.
 
@@ -254,22 +295,30 @@ function summarize(name, input = {}) {
   }
 }
 
-function assistantError(code) {
-  return ({
+// Turns known Claude Code / API failures into an actionable sentence.
+function explain(text) {
+  if (/claude_code_version_too_old|does not support this model/.test(text)) {
+    return "Your Claude Code is too old for this model. Update it by running `claude update` in Terminal (or `npm install -g @anthropic-ai/claude-code`), or pick another model, then try again. Lumen uses the newest Claude Code it finds.";
+  }
+  return null;
+}
+function assistantError(code, message) {
+  const text = message && Array.isArray(message.content) ? message.content.map((b) => b.text || "").join(" ") : "";
+  return explain(text) || ({
     authentication_failed: "Claude Code isn't signed in. Open Settings and sign in with Claude.",
     billing_error: "Your Claude plan can't run this request. Check your subscription on claude.ai.",
     rate_limit: "You've reached your Claude usage limit for now. Try again later.",
-  })[code] || `Claude Code reported an error (${code}).`;
+  })[code] || (text.trim() ? text.trim().slice(0, 600) : `Claude Code reported an error (${code}).`);
 }
 function resultError(msg) {
   if (msg.subtype === "error_max_turns") return "Claude hit its step limit for this request.";
   const errs = Array.isArray(msg.errors) ? msg.errors.join(" ") : "";
-  return errs || "Claude Code stopped with an error.";
+  return explain(errs) || errs || "Claude Code stopped with an error.";
 }
 function friendly(err) {
   const m = err && err.message ? err.message : String(err);
   if (/ENOENT/.test(m)) return "Couldn't start Claude Code. Check that it's installed.";
-  return m;
+  return explain(m) || m;
 }
 
-module.exports = { ClaudeCodeAgent, authStatus, login, logout, CLAUDE };
+module.exports = { ClaudeCodeAgent, authStatus, login, logout, claudePath };

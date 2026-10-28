@@ -83,7 +83,7 @@ const ccAgent = new cc.ClaudeCodeAgent({
   requestApproval,
 });
 const activeAgent = () => (settings.engine === "api" ? apiAgent : ccAgent);
-let ccState = { installed: !!cc.CLAUDE, loggedIn: false, method: null, email: null };
+let ccState = { installed: !!cc.claudePath(), loggedIn: false, method: null, email: null };
 let ccLoginInFlight = null;
 
 function createWindow() {
