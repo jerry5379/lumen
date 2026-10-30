@@ -115,11 +115,23 @@ class ClaudeCodeAgent {
   reset() {
     this.stop();
     this.sessionId = null;
+    this.sessionCwd = null;
     this.alwaysAllow.clear();
   }
 
   stop() {
     if (this.controller) this.controller.abort();
+  }
+
+  // Claude Code keeps the conversation itself; resuming only needs its session id.
+  snapshot() {
+    return { sessionId: this.sessionId, sessionCwd: this.sessionCwd };
+  }
+
+  restore(state) {
+    if (!state || !state.sessionId) return;
+    this.sessionId = state.sessionId;
+    this.sessionCwd = state.sessionCwd || null;
   }
 
   baseOptions(signalController) {
@@ -155,8 +167,19 @@ class ClaudeCodeAgent {
     };
 
     let sawText = false, failed = false;
+    const resumed = !!this.sessionId;
     // One clear error per request: Claude Code can report the same failure several ways.
-    const fail = (message) => { if (!failed) { failed = true; this.emit({ type: "error", message }); } };
+    const fail = (message) => {
+      if (failed) return;
+      failed = true;
+      // A saved session can disappear (Claude Code cleans up old ones); start fresh next time.
+      if (resumed && /no conversation found/i.test(message)) {
+        this.sessionId = null;
+        this.sessionCwd = null;
+        message = "Claude Code no longer has this chat's earlier history. Send your message again to continue in a fresh session.";
+      }
+      this.emit({ type: "error", message });
+    };
     try {
       for await (const msg of query({ prompt: userText, options })) {
         if (msg.session_id) { this.sessionId = msg.session_id; this.sessionCwd = this.getWorkspace(); }
@@ -245,8 +268,6 @@ class ClaudeCodeAgent {
 
   // ⌘K: one tool-free turn that returns only the replacement code.
   async inlineEdit({ path: file, before, selection, after, instruction }) {
-    if (!claudePath()) throw new Error("Claude Code isn't installed.");
-    const { query } = await sdk();
     const prompt = `Rewrite a snippet of ${file}.
 
 Instruction: ${instruction}
@@ -267,6 +288,14 @@ ${after.slice(0, 6000)}
 </after>
 
 Reply with only the replacement for the selected code, keeping its indentation style. No explanation, no code fences, and do not use any tools.`;
+    const text = await this.complete(prompt);
+    return text.replace(/^\s*```[^\n]*\n/, "").replace(/\n?```\s*$/, "");
+  }
+
+  // One tool-free turn outside the chat (⌘K, commit messages).
+  async complete(prompt) {
+    if (!claudePath()) throw new Error("Claude Code isn't installed.");
+    const { query } = await sdk();
     let text = "";
     for await (const msg of query({ prompt, options: { ...this.baseOptions(new AbortController()), tools: [], maxTurns: 1, persistSession: false, settingSources: [] } })) {
       if (msg.type === "result") {
@@ -274,7 +303,7 @@ Reply with only the replacement for the selected code, keeping its indentation s
         text = msg.result || "";
       }
     }
-    return text.replace(/^\s*```[^\n]*\n/, "").replace(/\n?```\s*$/, "");
+    return text;
   }
 }
 

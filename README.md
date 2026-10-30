@@ -15,6 +15,11 @@ Sign in with your **claude.ai** account (Pro or Max) and Lumen runs Claude Code 
   - Drag files between folders in the explorer to move them. Folders spring open when you hover over them.
   - Drop files from Finder onto the explorer to copy them into the workspace, or onto the editor or tab bar to open them.
   - Drag tabs to reorder them, and drag the panel edges to resize (double-click an edge to reset).
+- **Several agents at once.** Each tab in the Claude panel is its own chat with its own agent, so you can start one task, open a new tab (⌘T) and start another while the first keeps working. A tab's dot shows whether it's working, waiting for your approval, or has finished since you last looked. A background chat never takes over the editor; its approval waits in its tab. Closed chats stay in the history list (clock icon), where you can reopen or delete them.
+- **Integrated terminal.** A real shell (your login zsh) in a panel under the editor, like Cursor. Open several terminals as tabs, resize or maximize the panel, and click links in the output.
+  - Shell code blocks in Claude's replies get a **Run in terminal** button.
+  - Press ⌘L in the terminal (or the ✦ button) to add the selection, or the recent output, to the chat. Handy for "why did this fail?"
+- **Source control.** The second sidebar tab is a git panel: see changed files, click one for its diff, stage, unstage or discard, then commit. **Generate** has Claude write the commit message from your diff. Switch or create branches, and pull, push, fetch or sync. The current branch shows in the status bar, and changed files are colored in the explorer.
 - **System chores.** "Free up space in my Downloads", "Why does `npm start` fail in ~/work/api?" Commands always ask for approval first.
 - **Light, dark or system theme**, switchable from the title bar.
 
@@ -40,7 +45,7 @@ Open **Settings** (the gear icon) and pick how to connect:
 | Claude subscription (default) | **Sign in with Claude** opens claude.ai | Your Pro or Max plan |
 | Anthropic API | Console sign-in through the `ant` CLI, or an API key (stored encrypted with Electron `safeStorage`) | Pay per use |
 
-If `npm start` says Electron failed to install, run `node node_modules/electron/install.js`.
+If `npm start` says Electron failed to install, run `node node_modules/electron/install.js`. The terminal uses `node-pty`, which `npm install` rebuilds for Electron automatically. That step needs the Xcode command line tools (`xcode-select --install`).
 
 ## Build a Mac app
 
@@ -78,6 +83,11 @@ With the subscription engine, Claude Code's own tools are used (Read, Grep, Glob
 | ⌘O | Open another folder |
 | ⌘S | Save |
 | ⌘↵ / Esc | Accept / reject a diff |
+| ⌘T | New chat tab |
+| ⌃\` or ⌘J | Show or hide the terminal |
+| ⌃⇧\` | New terminal |
+| ⌘K / ⌘L in the terminal | Clear it / add its output to the chat |
+| ⇧⌘E / ⌃⇧G | Explorer / Source Control |
 
 ## Project layout
 

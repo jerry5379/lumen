@@ -255,3 +255,105 @@ body.resizing iframe, body.resizing textarea { pointer-events: none; }
 .mention .it.sel { background: var(--accent-soft); }
 .mention .it small { margin-left: auto; color: var(--muted); font-family: var(--font-code); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 55%; }
 .mention .empty { padding: 8px; color: var(--muted); }
+
+/* sidebar views: explorer | source control */
+.views { display: flex; gap: 2px; padding: 4px 6px 0; border-bottom: 1px solid var(--line); flex-shrink: 0; }
+.view-tab { position: relative; width: 34px; height: 30px; display: grid; place-items: center; color: var(--faint); border-bottom: 2px solid transparent; }
+.view-tab:hover { color: var(--fg); }
+.view-tab.active { color: var(--fg); border-bottom-color: var(--accent); }
+.view-tab .badge { position: absolute; top: 2px; right: 0; min-width: 15px; height: 15px; padding: 0 4px; border-radius: 8px; background: var(--accent); color: var(--accent-fg); font: 600 9.5px/15px var(--font-ui); }
+.view { display: flex; flex-direction: column; flex: 1; min-height: 0; }
+
+/* source control */
+.scm { display: flex; flex-direction: column; flex: 1; min-height: 0; }
+.scm-norepo { padding: 4px 12px; display: flex; flex-direction: column; gap: 8px; color: var(--muted); }
+.scm-norepo p { margin: 0 0 4px; line-height: 1.5; }
+.scm-branch { display: flex; align-items: center; gap: 6px; padding: 0 10px 8px; }
+.branch-btn { flex: 1; min-width: 0; display: flex; align-items: center; gap: 6px; height: 24px; padding: 0 6px; border-radius: 5px; font: 12px var(--font-code); color: var(--fg); overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.branch-btn:hover { background: var(--raise); }
+.btn.sync { height: 24px; padding: 0 8px; font: 11.5px var(--font-code); }
+.scm-commit { padding: 0 10px 8px; display: flex; flex-direction: column; gap: 6px; }
+#commitMsg { width: 100%; min-height: 44px; max-height: 160px; resize: vertical; border: 1px solid var(--line); border-radius: 6px; background: var(--editor); color: var(--fg); padding: 6px 8px; font: 12.5px/1.45 var(--font-ui); outline: none; }
+#commitMsg:focus { border-color: var(--accent); }
+.scm-commit-row { display: flex; gap: 6px; align-items: center; }
+.scm-commit-row #commitBtn { flex: 1; justify-content: center; }
+.amend { display: flex; align-items: center; gap: 4px; font-size: 11.5px; color: var(--muted); cursor: pointer; }
+.amend input { accent-color: var(--accent); margin: 0; }
+.scm-list { overflow: auto; flex: 1; padding-bottom: 12px; }
+.scm-group { display: flex; align-items: center; gap: 4px; width: 100%; height: 24px; padding: 0 6px 0 8px; font-size: 11px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; color: var(--muted); }
+.scm-group .chev { width: 12px; transition: transform .1s; }
+.scm-group.open .chev { transform: rotate(90deg); }
+.scm-group .count { margin-left: 4px; min-width: 16px; padding: 0 5px; border-radius: 8px; background: var(--raise); font: 10.5px/16px var(--font-code); text-align: center; }
+.scm-group .grow { flex: 1; }
+.scm-row { display: flex; align-items: center; gap: 6px; height: 22px; padding: 0 6px 0 26px; cursor: pointer; white-space: nowrap; }
+.scm-row:hover, .scm-row:focus-visible { background: var(--raise); outline: none; }
+.scm-row.sel { background: var(--accent-soft); }
+.scm-row .nm { overflow: hidden; text-overflow: ellipsis; flex-shrink: 1; min-width: 0; }
+.scm-row .nm.del { text-decoration: line-through; color: var(--muted); }
+.scm-row small { color: var(--faint); overflow: hidden; text-overflow: ellipsis; flex: 1; min-width: 0; font-size: 11.5px; }
+.scm-acts { display: none; gap: 1px; }
+.scm-row:hover .scm-acts, .scm-row:focus-within .scm-acts, .scm-group:hover .scm-acts { display: flex; }
+.scm-acts button { width: 20px; height: 20px; border-radius: 4px; display: grid; place-items: center; color: var(--muted); }
+.scm-acts button:hover { background: var(--line); color: var(--fg); }
+.st { width: 14px; text-align: center; font: 600 11px var(--font-code); flex-shrink: 0; }
+.st-M { color: var(--accent); } .st-A, .st-U { color: var(--add-fg); } .st-D { color: var(--del-fg); } .st-R, .st-C { color: var(--fn); } .st-conflict { color: var(--del-fg); }
+.commit-row { display: flex; flex-direction: column; padding: 3px 8px 3px 26px; line-height: 1.35; }
+.commit-row .subj { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.commit-row small { color: var(--faint); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.commit-row small code { font-family: var(--font-code); color: var(--muted); }
+.scm-empty { padding: 4px 12px 4px 26px; color: var(--faint); font-size: 12px; }
+
+/* git status in the explorer */
+.tree .row.g-M { color: var(--accent); } .tree .row.g-A, .tree .row.g-U { color: var(--add-fg); } .tree .row.g-D, .tree .row.g-C { color: var(--del-fg); }
+.tree .row.g-dir::after { content: ""; width: 5px; height: 5px; border-radius: 50%; background: var(--accent); margin-left: auto; opacity: .8; }
+
+/* integrated terminal */
+.term-panel { position: relative; display: flex; flex-direction: column; height: var(--term-h, 280px); min-height: 90px; border-top: 1px solid var(--line); background: var(--editor); flex-shrink: 0; }
+.editor-col.term-max .stage, .editor-col.term-max .crumbs, .editor-col.term-max .tabs { display: none; }
+.editor-col.term-max .term-panel { flex: 1; height: auto; border-top: 0; }
+.term-resizer { position: absolute; left: 0; right: 0; top: -3px; height: 6px; cursor: row-resize; z-index: 6; }
+.term-resizer:hover, .term-resizer.dragging { background: var(--accent); opacity: .6; }
+body.resizing-v { cursor: row-resize; user-select: none; }
+body.resizing-v .term-body { pointer-events: none; }
+.term-head { display: flex; align-items: center; gap: 6px; height: 32px; padding: 0 6px 0 12px; flex-shrink: 0; }
+.term-title { font-size: 11px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; color: var(--fg); box-shadow: inset 0 -2px 0 var(--accent); line-height: 30px; margin-right: 6px; }
+.term-tabs { display: flex; gap: 2px; overflow-x: auto; min-width: 0; scrollbar-width: none; }
+.term-tab { display: flex; align-items: center; gap: 4px; height: 22px; padding: 0 4px 0 8px; border-radius: 5px; color: var(--muted); font: 11.5px var(--font-code); white-space: nowrap; }
+.term-tab:hover { background: var(--raise); }
+.term-tab.active { background: var(--raise); color: var(--fg); }
+.term-tab .x { width: 16px; height: 16px; border-radius: 3px; display: grid; place-items: center; opacity: .55; }
+.term-tab .x:hover { background: var(--line); opacity: 1; }
+.term-head .grow { flex: 1; }
+.term-body { position: relative; flex: 1; min-height: 0; padding: 2px 0 4px 12px; }
+.term-view { position: absolute; inset: 2px 4px 4px 12px; }
+.term-view .xterm { height: 100%; }
+.term-view .xterm-viewport { background: transparent !important; }
+.term-empty { position: absolute; inset: 0; display: grid; place-items: center; color: var(--muted); }
+
+/* status bar buttons */
+.status .st-btn { display: inline-flex; align-items: center; gap: 5px; color: var(--muted); text-decoration: none; height: 18px; padding: 0 5px; margin: 0 -5px; border-radius: 4px; }
+.status .st-btn:hover { background: var(--raise); color: var(--fg); }
+.status .st-btn.on { color: var(--fg); }
+#scmView .pane-head { gap: 4px; }
+#scmView .pane-head > span:first-child { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+#scmView .pane-head > span:last-child { display: flex; flex-shrink: 0; }
+
+/* chat tabs: each one is its own agent */
+.chat-tabs { display: flex; gap: 2px; padding: 4px 8px; border-bottom: 1px solid var(--line); overflow-x: auto; flex-shrink: 0; scrollbar-width: none; }
+.chat-tabs::-webkit-scrollbar { display: none; }
+.chat-tab { display: flex; align-items: center; gap: 5px; height: 24px; padding: 0 3px 0 8px; border-radius: 6px; color: var(--muted); font-size: 12px; white-space: nowrap; flex: 0 1 160px; min-width: 72px; }
+.chat-tab:hover { background: var(--raise); }
+.chat-tab.active { background: var(--raise); color: var(--fg); }
+.chat-tab .nm { overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.chat-tab .x { width: 16px; height: 16px; border-radius: 3px; display: grid; place-items: center; opacity: 0; flex-shrink: 0; }
+.chat-tab:hover .x, .chat-tab.active .x { opacity: .6; }
+.chat-tab .x:hover { background: var(--line); opacity: 1; }
+.cstate { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; display: none; }
+.cstate.run { display: block; background: var(--accent); animation: pulse 1.2s infinite ease-in-out; }
+.cstate.wait { display: block; background: var(--del-fg); }
+.cstate.unread { display: block; background: var(--fn); }
+.logs { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.palette .it .cstate { margin-left: 2px; }
+.palette .it .del { margin-left: 8px; width: 20px; height: 20px; border-radius: 4px; display: grid; place-items: center; color: var(--muted); flex-shrink: 0; }
+.palette .it .del:hover { background: var(--line); color: var(--del-fg); }
+@media (prefers-reduced-motion: reduce) { .cstate.run { animation: none; } }

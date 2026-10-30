@@ -10,10 +10,15 @@ const state = {
   tabs: [],            // { path, text, savedText }
   active: null,
   pending: null,       // { path, before, after, label, onAccept, onReject }
-  busy: false,
+  chats: [],           // chat tabs from the main process: { id, title, running, closed, used, updatedAt }
+  chat: null,          // the chat shown in the Claude panel
   expanded: new Set(),
   fileIndex: null,
-  attachments: [],     // { path, dir } dragged into the chat
+  attachments: [],     // { path, dir } dragged into the chat, or { label, text } from the terminal
+  terms: [],           // { id, x, fit, el, title, n } integrated terminals
+  activeTerm: null,
+  git: null,           // last git status for the workspace
+  view: "files",       // sidebar view: files | scm
 };
 
 /* ---------- language + highlighting ---------- */
@@ -55,6 +60,7 @@ async function renderTree() {
   const tree = $("tree");
   tree.innerHTML = "";
   await renderDir(tree, state.workspace, 0);
+  decorateTree();
 }
 async function renderDir(container, dir, depth) {
   let entries;
@@ -82,7 +88,7 @@ async function renderDir(container, dir, depth) {
         const open = kids.hidden;
         kids.hidden = !open;
         b.classList.toggle("open", open);
-        if (open) { state.expanded.add(en.path); if (!kids.childElementCount) await renderDir(kids, en.path, depth + 1); }
+        if (open) { state.expanded.add(en.path); if (!kids.childElementCount) { await renderDir(kids, en.path, depth + 1); decorateTree(); } }
         else state.expanded.delete(en.path);
       };
       b.onclick = toggle;
@@ -91,6 +97,12 @@ async function renderDir(container, dir, depth) {
       b.onclick = () => openFile(en.path);
     }
   }
+}
+// New files an agent writes appear in the explorer; batched because agents write in bursts.
+let treeTimer = null;
+function scheduleTree(p) {
+  if (treeTimer || [...treeEl.querySelectorAll(".row")].some((r) => r.dataset.path === p)) return;
+  treeTimer = setTimeout(() => { treeTimer = null; renderTree(); }, 600);
 }
 function markActiveInTree() {
   document.querySelectorAll("#tree .row.active").forEach((r) => r.classList.remove("active"));
@@ -109,6 +121,7 @@ async function setWorkspace(ws) {
   $("wsPath").textContent = pretty || "~";
   $("wsPath").title = ws;
   await renderTree();
+  refreshGit();
 }
 
 /* ---------- tabs + editor ---------- */
@@ -218,6 +231,8 @@ async function openFile(p, { focus = true } = {}) {
   return true;
 }
 function activate(p) {
+  // A source control diff isn't tied to a tab; switching tabs closes it.
+  if (state.pending && state.pending.standalone) state.pending = null;
   state.active = p;
   ta.scrollTop = 0; ta.scrollLeft = 0;
   renderTabs(); renderEditor(); markActiveInTree();
@@ -245,6 +260,7 @@ async function saveActive() {
     t.savedText = t.text;
     renderTabs();
     toast("Saved " + base(t.path));
+    refreshGit();
   } catch (e) { toast("Couldn't save: " + e.message); }
 }
 async function reloadFromDisk(p) {
@@ -303,13 +319,16 @@ function showDiff(d) {
   state.pending = d;
   renderDiff();
 }
+const diffShown = () => !!state.pending && (state.pending.standalone || state.pending.path === state.active);
 function renderDiff() {
   const d = state.pending;
-  const show = d && d.path === state.active;
+  const show = diffShown();
   $("diff").hidden = !show;
   if (!show) return;
   const r = diffHtml(d.before, d.after, d.path);
   $("diffTitle").textContent = d.label;
+  $("acceptBtn").firstElementChild.textContent = d.acceptLabel || "Accept";
+  $("rejectBtn").firstElementChild.textContent = d.rejectLabel || "Reject";
   $("diffStat").innerHTML = `<span style="color:var(--add-fg)">+${r.adds}</span> <span style="color:var(--del-fg)">−${r.dels}</span>`;
   $("diffBody").innerHTML = r.html;
   const first = $("diffBody").querySelector(".add,.del");
@@ -325,7 +344,8 @@ $("acceptBtn").onclick = () => resolveDiff(true);
 $("rejectBtn").onclick = () => resolveDiff(false);
 
 /* ---------- chat ---------- */
-const log = $("log");
+// Each chat has its own log element; `log` and `reply` point at the one being drawn into.
+let log = null;
 const SPARK = '<svg width="12" height="12" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M8 1.5v3M8 11.5v3M1.5 8h3M11.5 8h3M3.4 3.4l2.1 2.1M10.5 10.5l2.1 2.1M3.4 12.6l2.1-2.1M10.5 5.5l2.1-2.1" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>';
 
 function welcome() {
@@ -365,13 +385,15 @@ function codeBlock(info, code, open) {
   const lang = info.split(/\s+/)[0] || "";
   const id = "b" + (++blockSeq);
   blocks[id] = code;
-  return `<div class="cb"><div class="cb-head"><span class="grow">${esc(info || "code")}</span>${open ? "" : `<button type="button" data-act="insert" data-id="${id}">Insert at cursor</button><button type="button" data-act="copy" data-id="${id}">Copy</button>`}</div><pre>${highlight(code, "x." + lang)}</pre></div>`;
+  const run = SHELL_LANGS.has(lang.toLowerCase()) ? `<button type="button" data-act="run" data-id="${id}">Run in terminal</button>` : "";
+  return `<div class="cb"><div class="cb-head"><span class="grow">${esc(info || "code")}</span>${open ? "" : `${run}<button type="button" data-act="insert" data-id="${id}">Insert at cursor</button><button type="button" data-act="copy" data-id="${id}">Copy</button>`}</div><pre>${highlight(code, "x." + lang)}</pre></div>`;
 }
-log.addEventListener("click", async (e) => {
+$("logs").addEventListener("click", async (e) => {
   const b = e.target.closest("[data-act]");
   if (!b) return;
   const code = blocks[b.dataset.id];
-  if (b.dataset.act === "copy") {
+  if (b.dataset.act === "run") runInTerminal(code);
+  else if (b.dataset.act === "copy") {
     try { await navigator.clipboard.writeText(code); toast("Copied"); } catch { toast("Couldn't copy"); }
   } else if (b.dataset.act === "insert") {
     const t = tab(); if (!t) return toast("Open a file first");
@@ -428,7 +450,8 @@ function toolLabel(name, input = {}) {
   }
 }
 
-api.onEvent((ev) => {
+// Live events and saved ones replayed at launch (replay = true) render the same way.
+function handleEvent(ev, replay = false) {
   const r = replyEl();
   switch (ev.type) {
     case "round": endSegment(); break;
@@ -478,25 +501,62 @@ api.onEvent((ev) => {
       if (ev.error) d.open = false;
       break;
     }
-    case "approval": showApproval(ev); break;
+    case "approval": showApproval(ev, replay); break;
+    case "approval_result": {
+      const card = log.querySelector(`.approval[data-id="${CSS.escape(ev.id)}"]`);
+      if (card) resolveCard(card, ev.decision === "deny" ? "Declined" : ev.decision === "always" ? "Allowed (and for the rest of this chat)" : "Allowed");
+      break;
+    }
     case "approval_cancelled": {
       const card = log.querySelector(`.approval[data-id="${CSS.escape(ev.id)}"]`);
       if (card) resolveCard(card, "Cancelled");
       if (state.pending && state.pending.approvalId === ev.id) { state.pending = null; renderDiff(); }
       break;
     }
-    case "file_changed": reloadFromDisk(ev.path); state.fileIndex = null; break;
+    case "file_changed": reloadFromDisk(ev.path); state.fileIndex = null; scheduleGit(); scheduleTree(ev.path); break;
     case "notice": r.el.insertAdjacentHTML("beforeend", `<div class="notice">${esc(ev.text)}</div>`); break;
-    case "error": r.el.insertAdjacentHTML("beforeend", `<div class="error">${esc(ev.message)}</div>`); if (/API key|Sign in|sign in|signed in/.test(ev.message)) openSettings(); break;
+    case "error": r.el.insertAdjacentHTML("beforeend", `<div class="error">${esc(ev.message)}</div>`); if (!replay && ev.chat === state.chat && /API key|Sign in|sign in|signed in/.test(ev.message)) openSettings(); break;
     case "done":
+      if (!replay) refreshGit();
       if (ev.stopped) r.el.insertAdjacentHTML("beforeend", `<div class="notice">Stopped.</div>`);
       r.el.querySelectorAll(".pulse").forEach((p) => p.remove());
       r.el.querySelectorAll(".tool.running").forEach((t) => { t.className = "tool err"; });
       break;
   }
+}
+api.onEvent((ev) => {
+  inChat(ev.chat, () => handleEvent(ev));
+  if (["done", "error", "approval", "approval_cancelled"].includes(ev.type)) {
+    const c = chatUI[ev.chat];
+    if (c && ev.chat !== state.chat && ev.type !== "approval_cancelled") c.unread = true;
+    renderChatTabs();
+  }
 });
 
-function showApproval(ev) {
+const userEl = (text, ctx) => addEl("msg user", esc(text) + (ctx ? `<span class="ctx">${esc(ctx)}</span>` : ""));
+
+// Show a chat's saved transcript.
+async function restoreChat(id) {
+  let saved = [];
+  try { saved = await api.chats.history(id); } catch {}
+  inChat(id, () => {
+    if (!saved.length) return welcome();
+    log.innerHTML = "";
+    reply = null;
+    for (const ev of saved) {
+      if (ev.type === "user") { reply = null; userEl(ev.text, ev.ctx); continue; }
+      handleEvent(ev, true);
+      if (ev.type === "done") reply = null;
+    }
+    // The app may have quit mid-reply.
+    log.querySelectorAll(".pulse").forEach((p) => p.remove());
+    log.querySelectorAll(".tool.running").forEach((t) => { t.className = "tool err"; });
+    reply = null;
+    log.scrollTop = log.scrollHeight;
+  });
+}
+
+function showApproval(ev, replay = false) {
   const r = replyEl();
   const card = document.createElement("div");
   card.className = "approval";
@@ -506,8 +566,10 @@ function showApproval(ev) {
   if (p.kind === "command") {
     body = `<div class="q">Run this command?</div><pre>${esc(p.command)}</pre><div class="verdict">in ${esc(p.cwd)}</div>`;
   } else {
-    const st = diffHtml(p.before, p.after, p.path);
-    body = `<div class="q">${p.created ? "Create" : "Change"} ${esc(base(p.path))}? <span class="stat"><span style="color:var(--add-fg)">+${st.adds}</span> <span style="color:var(--del-fg)">−${st.dels}</span></span></div><div class="verdict">${esc(p.path)}</div>`;
+    // Saved approvals drop the file contents, so there's no line count to show.
+    const st = p.before != null ? diffHtml(p.before, p.after, p.path) : null;
+    const stat = st ? ` <span class="stat"><span style="color:var(--add-fg)">+${st.adds}</span> <span style="color:var(--del-fg)">−${st.dels}</span></span>` : "";
+    body = `<div class="q">${p.created ? "Create" : "Change"} ${esc(base(p.path))}?${stat}</div><div class="verdict">${esc(p.path)}</div>`;
   }
   const kind = ev.name === "run_command" ? "commands" : "file edits";
   card.innerHTML = `${body}<div class="acts">
@@ -518,12 +580,15 @@ function showApproval(ev) {
   r.el.appendChild(card);
   r.seg = null;
   scrollLog();
+  // A saved decision (approval_result / approval_cancelled) replaces this if there was one.
+  if (replay) return resolveCard(card, "Not answered");
 
   const decide = (decision) => {
     if (card.classList.contains("resolved")) return;
     if (state.pending && state.pending.approvalId === ev.id) { state.pending = null; renderDiff(); }
     resolveCard(card, decision === "deny" ? "Declined" : decision === "always" ? "Allowed (and for the rest of this chat)" : "Allowed");
     api.approve(ev.id, decision);
+    renderChatTabs();
   };
   const view = async () => {
     // A file Claude creates may not exist yet; show the diff over a placeholder tab.
@@ -534,7 +599,8 @@ function showApproval(ev) {
     showDiff({ path: p.path, before: p.before, after: p.after, label: `Claude wants to ${p.created ? "create" : "edit"} ${base(p.path)}`, approvalId: ev.id, onAccept: () => decide("allow"), onReject: () => decide("deny") });
   };
   card.querySelectorAll("[data-d]").forEach((b) => b.onclick = () => (b.dataset.d === "view" ? view() : decide(b.dataset.d)));
-  if (p.kind === "diff") view();
+  // Only the chat you're looking at may take over the editor with its diff.
+  if (p.kind === "diff" && ev.chat === state.chat) view();
 }
 function resolveCard(card, verdict) {
   card.classList.add("resolved");
@@ -545,14 +611,15 @@ function resolveCard(card, verdict) {
 const promptEl = $("prompt"), sendBtn = $("send");
 const SEND_ICON = sendBtn.innerHTML;
 const STOP_ICON = '<svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><rect x="2" y="2" width="8" height="8" rx="1.5" fill="currentColor"/></svg>';
+const chatBusy = () => !!(state.chats.find((c) => c.id === state.chat) || {}).running;
 function updateSend() {
-  if (state.busy) { sendBtn.disabled = false; sendBtn.classList.add("stop"); sendBtn.innerHTML = STOP_ICON; sendBtn.setAttribute("aria-label", "Stop"); return; }
+  if (chatBusy()) { sendBtn.disabled = false; sendBtn.classList.add("stop"); sendBtn.innerHTML = STOP_ICON; sendBtn.setAttribute("aria-label", "Stop"); return; }
   sendBtn.classList.remove("stop"); sendBtn.innerHTML = SEND_ICON; sendBtn.setAttribute("aria-label", "Send");
   sendBtn.disabled = !promptEl.value.trim();
 }
 promptEl.addEventListener("input", () => { promptEl.style.height = "auto"; promptEl.style.height = Math.min(200, promptEl.scrollHeight) + "px"; updateSend(); });
-promptEl.addEventListener("keydown", (e) => { if (mention.open) return; if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); if (!state.busy) send(); } });
-sendBtn.onclick = () => (state.busy ? api.stop() : send());
+promptEl.addEventListener("keydown", (e) => { if (mention.open) return; if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); if (!chatBusy()) send(); } });
+sendBtn.onclick = () => (chatBusy() ? api.stop(state.chat) : send());
 
 let selMemo = null;
 ta.addEventListener("blur", () => { selMemo = ta.selectionStart !== ta.selectionEnd ? { s: ta.selectionStart, e: ta.selectionEnd } : null; });
@@ -573,8 +640,9 @@ function renderCtx() {
   const sel = currentSel();
   if (sel) bar.insertAdjacentHTML("beforeend", `<span class="pill on">lines ${sel.l1}${sel.l2 !== sel.l1 ? "–" + sel.l2 : ""}</span>`);
   state.attachments.forEach((a, i) => {
-    const icon = a.dir ? "📁 " : `<span class="dot" style="background:${DOT[ext(a.path)] || "var(--faint)"}"></span>`;
-    bar.insertAdjacentHTML("beforeend", `<span class="pill att" title="${esc(a.path)}">${icon}${esc(base(a.path) || a.path)}<button type="button" class="rm" data-i="${i}" aria-label="Remove ${esc(base(a.path))}">×</button></span>`);
+    const name = a.label || base(a.path) || a.path;
+    const icon = a.text != null ? "&gt;_ " : a.dir ? "📁 " : `<span class="dot" style="background:${DOT[ext(a.path)] || "var(--faint)"}"></span>`;
+    bar.insertAdjacentHTML("beforeend", `<span class="pill att" title="${esc(a.text != null ? a.text.slice(-400) : a.path)}">${icon}${esc(name)}<button type="button" class="rm" data-i="${i}" aria-label="Remove ${esc(name)}">×</button></span>`);
   });
   bar.insertAdjacentHTML("beforeend", `<span class="pill" title="${esc(state.workspace)}">workspace: ${esc(base(state.workspace) || "/")}</span>`);
 }
@@ -810,6 +878,7 @@ mentionEl.addEventListener("click", (e) => { const b = e.target.closest("[data-i
 async function attachmentContext(list) {
   const parts = [];
   for (const a of list) {
+    if (a.text != null) { parts.push(`${a.label}:\n\`\`\`\n${a.text}\n\`\`\``); continue; }
     if (a.dir) { parts.push(`Attached folder: ${a.path}`); continue; }
     let r = null;
     try { r = await api.read(a.path); } catch {}
@@ -821,14 +890,14 @@ async function attachmentContext(list) {
 
 async function send() {
   const q = promptEl.value.trim();
-  if (!q || state.busy) return;
+  if (!q || chatBusy()) return;
   if (!state.info.connected) { openSettings(); return; }
   const t = tab(), sel = currentSel();
   promptEl.value = ""; promptEl.dispatchEvent(new Event("input"));
   const atts = state.attachments.splice(0);
   renderCtx();
-  const ctxNote = [t ? base(t.path) : null, sel ? `L${sel.l1}${sel.l2 !== sel.l1 ? "–" + sel.l2 : ""}` : null, ...atts.map((a) => base(a.path))].filter(Boolean).join(" · ");
-  addEl("msg user", esc(q) + (ctxNote ? `<span class="ctx">${esc(ctxNote)}</span>` : ""));
+  const ctxNote = [t ? base(t.path) : null, sel ? `L${sel.l1}${sel.l2 !== sel.l1 ? "–" + sel.l2 : ""}` : null, ...atts.map((a) => a.label || base(a.path))].filter(Boolean).join(" · ");
+  userEl(q, ctxNote);
 
   let full = q;
   const ctx = [];
@@ -840,12 +909,13 @@ async function send() {
   if (sel) ctx.push(`Selected lines ${sel.l1}-${sel.l2}:\n\`\`\`\n${sel.text}\n\`\`\``);
   if (ctx.length) full = `<editor_context>\n${ctx.join("\n\n")}\n</editor_context>\n\n${q}`;
 
+  const id = state.chat;
   reply = null;
-  replyEl().el.insertAdjacentHTML("beforeend", "");
-  state.busy = true; updateSend();
-  try { await api.send(full); }
-  catch (e) { replyEl().el.insertAdjacentHTML("beforeend", `<div class="error">${esc(e.message)}</div>`); }
-  finally { state.busy = false; updateSend(); reply = null; }
+  replyEl();
+  setRunning(id, true);
+  try { await api.send(id, full, { text: q, ctx: ctxNote }); }
+  catch (e) { inChat(id, () => replyEl().el.insertAdjacentHTML("beforeend", `<div class="error">${esc(errMsg(e))}</div>`)); setRunning(id, false); }
+  finally { inChat(id, () => { reply = null; }); }
 }
 
 /* ---------- theme ---------- */
@@ -864,6 +934,7 @@ function applyTheme(mode) {
   b.title = b.ariaLabel = `Theme: ${mode} (click to change)`;
   try { localStorage.setItem("lumen.theme", mode); } catch {}
   api.setTheme(mode).catch(() => {});
+  refreshTermTheme();
   return mode;
 }
 let themeMode = "system";
@@ -871,7 +942,6 @@ try { themeMode = localStorage.getItem("lumen.theme") || "system"; } catch {}
 themeMode = applyTheme(themeMode);
 $("themeBtn").onclick = () => { themeMode = applyTheme(THEMES[(THEMES.indexOf(themeMode) + 1) % THEMES.length]); toast(`Theme: ${themeMode}`); };
 
-$("clearChat").onclick = async () => { await api.reset(); state.pending = null; renderDiff(); welcome(); };
 
 /* ---------- ⌘K inline edit ---------- */
 let inlineRange = null, inlineBusy = false;
@@ -1090,22 +1160,585 @@ function toast(msg) {
 document.addEventListener("keydown", (e) => {
   const mod = e.metaKey || e.ctrlKey, k = e.key.toLowerCase();
   if (!$("settings").hidden) { if (e.key === "Escape") $("settings").hidden = true; return; }
-  if (mod && k === "k") { e.preventDefault(); openInline(); }
+  const inTerm = !!(document.activeElement && document.activeElement.closest(".term-panel"));
+  if (e.ctrlKey && !e.metaKey && e.code === "Backquote") { e.preventDefault(); if (e.shiftKey) newTerminal(); else toggleTerminal(); }
+  else if (e.metaKey && !e.shiftKey && k === "j") { e.preventDefault(); toggleTerminal(); }
+  else if (e.metaKey && e.shiftKey && k === "e") { e.preventDefault(); showView("files"); }
+  else if (e.ctrlKey && e.shiftKey && k === "g") { e.preventDefault(); showView("scm"); }
+  else if (inTerm && mod && k === "k") { e.preventDefault(); clearTerminal(); }
+  else if (inTerm && mod && k === "l") { e.preventDefault(); termToChat(); }
+  else if (inTerm && (e.key === "Escape" || (mod && (k === "w" || e.key === "Enter")))) { /* leave these to the shell */ }
+  else if (e.metaKey && !e.shiftKey && k === "t") { e.preventDefault(); newChat(); }
+  else if (mod && k === "k") { e.preventDefault(); openInline(); }
   else if (mod && k === "l") { e.preventDefault(); if (document.activeElement === ta) selMemo = ta.selectionStart !== ta.selectionEnd ? { s: ta.selectionStart, e: ta.selectionEnd } : null; promptEl.focus(); renderCtx(); }
   else if (mod && k === "p") { e.preventDefault(); openPalette(); }
   else if (mod && k === "o") { e.preventDefault(); chooseFolder(); }
   else if (mod && k === "s") { e.preventDefault(); saveActive(); }
   else if (mod && k === "w") { e.preventDefault(); if (state.active) closeTab(state.active); }
-  else if (mod && e.key === "Enter" && state.pending && state.pending.path === state.active) { e.preventDefault(); resolveDiff(true); }
-  else if (e.key === "Escape" && state.pending && state.pending.path === state.active && $("inline").hidden && !document.querySelector(".overlay:not([hidden])")) { resolveDiff(false); }
+  else if (mod && e.key === "Enter" && diffShown() && document.activeElement !== $("commitMsg")) { e.preventDefault(); resolveDiff(true); }
+  else if (e.key === "Escape" && diffShown() && $("inline").hidden && !document.querySelector(".overlay:not([hidden])")) { resolveDiff(false); }
 });
+
+/* ---------- integrated terminal ---------- */
+const SHELL_LANGS = new Set(["sh", "bash", "zsh", "shell", "console", "terminal"]);
+const termPanel = $("termPanel"), termBody = $("termBody");
+const termBuf = {};   // output that arrives before its terminal is registered
+let termSeq = 0;
+const ANSI_DARK = { black: "#1b212c", red: "#f07178", green: "#a3d48d", yellow: "#e4c06c", blue: "#7fbaf0", magenta: "#c59df0", cyan: "#76d0d6", white: "#d9dfe9", brightBlack: "#5c6677", brightRed: "#ff8b92", brightGreen: "#bde6a8", brightYellow: "#f2d38a", brightBlue: "#9fcdf7", brightMagenta: "#d7b8f6", brightCyan: "#9be1e5", brightWhite: "#ffffff" };
+const ANSI_LIGHT = { black: "#1c2330", red: "#c4343b", green: "#2e7a33", yellow: "#946100", blue: "#1d61b0", magenta: "#7b3fc2", cyan: "#13808a", white: "#8b95a5", brightBlack: "#5a6577", brightRed: "#d9464d", brightGreen: "#3b8f41", brightYellow: "#a7651a", brightBlue: "#2f74c4", brightMagenta: "#8f55d4", brightCyan: "#1d939e", brightWhite: "#1c2330" };
+function termTheme() {
+  const cs = getComputedStyle(document.documentElement), v = (n) => cs.getPropertyValue(n).trim();
+  const dark = !/light/.test(cs.getPropertyValue("color-scheme"));
+  return { ...(dark ? ANSI_DARK : ANSI_LIGHT), background: v("--editor"), foreground: v("--fg"), cursor: v("--accent"), cursorAccent: v("--editor"), selectionBackground: dark ? "rgba(127,186,240,.3)" : "rgba(29,97,176,.22)" };
+}
+function refreshTermTheme() {
+  if (!state.terms.length) return;
+  const theme = termTheme();
+  state.terms.forEach((t) => { t.x.options.theme = theme; });
+}
+window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", refreshTermTheme);
+
+const termById = (id) => state.terms.find((t) => t.id === id);
+const activeTerm = () => termById(state.activeTerm);
+function renderTermTabs() {
+  const el = $("termTabs");
+  el.innerHTML = state.terms.map((t) => `<div class="term-tab${t.id === state.activeTerm ? " active" : ""}" role="tab" data-id="${t.id}"><button type="button" class="nm">${t.n}: ${esc(t.title)}</button><button type="button" class="x" aria-label="Kill terminal ${t.n}"><svg width="9" height="9" viewBox="0 0 10 10" aria-hidden="true"><path d="M2 2l6 6M8 2l-6 6" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg></button></div>`).join("");
+  $("stTerm").classList.toggle("on", !termPanel.hidden);
+}
+$("termTabs").addEventListener("click", (e) => {
+  const tabEl = e.target.closest(".term-tab"); if (!tabEl) return;
+  const id = +tabEl.dataset.id;
+  if (e.target.closest(".x")) closeTerminal(id); else activateTerm(id, true);
+});
+function fitTerm(t = activeTerm()) {
+  if (!t || termPanel.hidden) return;
+  try { t.fit.fit(); } catch {}
+}
+new ResizeObserver(() => requestAnimationFrame(() => fitTerm())).observe(termBody);
+
+function showTermPanel(show) {
+  termPanel.hidden = !show;
+  if (!show) document.querySelector(".editor-col").classList.remove("term-max");
+  renderTermTabs();
+  if (show) requestAnimationFrame(() => fitTerm());
+}
+async function newTerminal(cwd) {
+  if (!window.Terminal || !window.FitAddon) { toast("The terminal couldn't load. Run npm install and restart Lumen."); return null; }
+  showTermPanel(true);
+  const el = document.createElement("div");
+  el.className = "term-view";
+  termBody.appendChild(el);
+  const x = new window.Terminal({
+    fontFamily: getComputedStyle(document.documentElement).getPropertyValue("--font-code").trim() || "Menlo, monospace",
+    fontSize: 12.5, lineHeight: 1.25, cursorBlink: true, scrollback: 10000,
+    macOptionIsMeta: true, macOptionClickForcesSelection: true, theme: termTheme(),
+  });
+  const fit = new window.FitAddon.FitAddon();
+  x.loadAddon(fit);
+  if (window.WebLinksAddon) x.loadAddon(new window.WebLinksAddon.WebLinksAddon((_e, uri) => window.open(uri)));
+  // Let the app's shortcuts reach the document instead of the shell.
+  x.attachCustomKeyEventHandler((e) => !(e.type === "keydown" && ((e.ctrlKey && e.code === "Backquote") || (e.metaKey && /^[jklpos]$/i.test(e.key)) || (e.metaKey && e.shiftKey && /^e$/i.test(e.key)) || (e.ctrlKey && e.shiftKey && /^g$/i.test(e.key)))));
+  x.open(el);
+  try { fit.fit(); } catch {}
+  let r;
+  try { r = await api.term.create({ cwd: cwd || state.workspace, cols: x.cols, rows: x.rows }); }
+  catch (err) { x.dispose(); el.remove(); toast("Couldn't start a shell: " + errMsg(err)); if (!state.terms.length) showTermPanel(false); return null; }
+  const t = { id: r.id, x, fit, el, title: r.shell, n: ++termSeq };
+  state.terms.push(t);
+  x.onData((d) => api.term.write(t.id, d));
+  x.onResize(({ cols, rows }) => api.term.resize(t.id, cols, rows));
+  x.onTitleChange((title) => { if (title) { t.title = title.length > 28 ? "…" + title.slice(-27) : title; renderTermTabs(); } });
+  (termBuf[t.id] || []).forEach((d) => x.write(d));
+  delete termBuf[t.id];
+  activateTerm(t.id, true);
+  return t;
+}
+function activateTerm(id, focus) {
+  const t = termById(id); if (!t) return;
+  state.activeTerm = id;
+  state.terms.forEach((o) => { o.el.hidden = o !== t; });
+  renderTermTabs();
+  requestAnimationFrame(() => { fitTerm(t); if (focus) t.x.focus(); });
+}
+function closeTerminal(id = state.activeTerm) {
+  const i = state.terms.findIndex((t) => t.id === id);
+  if (i < 0) return;
+  const [t] = state.terms.splice(i, 1);
+  api.term.kill(t.id).catch(() => {});
+  t.x.dispose(); t.el.remove();
+  if (state.activeTerm === id) {
+    const next = state.terms[Math.max(0, i - 1)];
+    state.activeTerm = next ? next.id : null;
+    if (next) activateTerm(next.id, true);
+  }
+  if (!state.terms.length) { showTermPanel(false); ta.focus(); }
+  renderTermTabs();
+}
+async function toggleTerminal() {
+  if (termPanel.hidden) {
+    showTermPanel(true);
+    if (!state.terms.length) await newTerminal(); else activateTerm(state.activeTerm, true);
+  } else if (document.activeElement && document.activeElement.closest(".term-panel")) {
+    showTermPanel(false);
+    if (state.active) ta.focus();
+  } else {
+    activateTerm(state.activeTerm, true);
+  }
+}
+function clearTerminal() { const t = activeTerm(); if (t) { t.x.clear(); t.x.focus(); } }
+// Cursor-style: the selection, or the last screenful of output, goes to the chat as context.
+function termToChat() {
+  const t = activeTerm(); if (!t) return;
+  let text = t.x.getSelection();
+  if (!text.trim()) {
+    const b = t.x.buffer.active, lines = [];
+    for (let i = Math.max(0, b.length - 200); i < b.length; i++) lines.push(b.getLine(i).translateToString(true));
+    text = lines.join("\n");
+  }
+  text = text.replace(/\s+$/, "");
+  if (!text) return toast("Nothing in the terminal to add yet");
+  if (text.length > 20000) text = "…\n" + text.slice(-20000);
+  state.attachments.push({ label: `Terminal ${t.n} (${t.title})`, text });
+  renderCtx();
+  promptEl.focus();
+}
+async function runInTerminal(code) {
+  const cmd = code.split("\n").map((l) => l.replace(/^\s*\$ /, "")).filter((l) => l.trim()).join("\r");
+  if (!cmd) return;
+  let t = activeTerm();
+  if (termPanel.hidden || !t) { showTermPanel(true); t = t || (await newTerminal()); }
+  if (!t) return;
+  activateTerm(t.id, true);
+  api.term.write(t.id, cmd + "\r");
+}
+api.term.onData(({ id, data }) => {
+  const t = termById(id);
+  if (t) t.x.write(data); else (termBuf[id] = termBuf[id] || []).push(data);
+  scheduleGit();
+});
+api.term.onExit(({ id }) => { if (termById(id)) closeTerminal(id); });
+
+$("termNew").onclick = () => newTerminal();
+$("termKill").onclick = () => closeTerminal();
+$("termClear").onclick = clearTerminal;
+$("termChat").onclick = termToChat;
+$("termHide").onclick = () => { showTermPanel(false); if (state.active) ta.focus(); };
+$("termMax").onclick = () => {
+  const col = document.querySelector(".editor-col");
+  const max = col.classList.toggle("term-max");
+  $("termMax").title = max ? "Restore panel size" : "Maximize panel";
+  $("termMax").querySelector("svg").style.transform = max ? "rotate(180deg)" : "";
+  requestAnimationFrame(() => fitTerm());
+};
+$("stTerm").onclick = toggleTerminal;
+{
+  const handle = $("termResize"), key = "lumen.--term-h";
+  const apply = (h) => { const col = document.querySelector(".editor-col"); h = Math.round(Math.max(90, Math.min(h, col.clientHeight - 120))); termPanel.style.setProperty("--term-h", h + "px"); return h; };
+  try { const v = +localStorage.getItem(key); if (v) apply(v); } catch {}
+  handle.addEventListener("pointerdown", (e) => {
+    e.preventDefault();
+    handle.setPointerCapture(e.pointerId);
+    handle.classList.add("dragging"); document.body.classList.add("resizing-v");
+    const bottom = termPanel.getBoundingClientRect().bottom;
+    let h = 0;
+    const move = (ev) => { h = apply(bottom - ev.clientY); };
+    const up = () => {
+      handle.removeEventListener("pointermove", move); handle.removeEventListener("pointerup", up);
+      handle.classList.remove("dragging"); document.body.classList.remove("resizing-v");
+      if (h) try { localStorage.setItem(key, h); } catch {}
+      fitTerm();
+    };
+    handle.addEventListener("pointermove", move); handle.addEventListener("pointerup", up);
+  });
+  handle.addEventListener("dblclick", () => { termPanel.style.removeProperty("--term-h"); try { localStorage.removeItem(key); } catch {} fitTerm(); });
+}
+
+/* ---------- sidebar views ---------- */
+function showView(v) {
+  state.view = v;
+  document.querySelectorAll(".view-tab").forEach((b) => { b.classList.toggle("active", b.dataset.view === v); b.setAttribute("aria-selected", b.dataset.view === v); });
+  $("filesView").hidden = v !== "files";
+  $("scmView").hidden = v !== "scm";
+  if (v === "scm") { refreshGit(); if (!$("scmMain").hidden) $("commitMsg").focus(); }
+}
+document.querySelectorAll(".view-tab").forEach((b) => b.onclick = () => showView(b.dataset.view));
+
+/* ---------- source control ---------- */
+const errMsg = (e) => String((e && e.message) || e).replace(/^Error invoking remote method '[^']+': (Error: )?/, "");
+const scmCollapsed = new Set(["commits"]);
+let gitBusy = false, gitAgain = false, gitTimer = null, gitLast = 0;
+async function refreshGit() {
+  if (gitBusy) { gitAgain = true; return; }
+  gitBusy = true; gitLast = Date.now();
+  try { state.git = await api.git.status(); }
+  catch (e) { state.git = { repo: null, error: errMsg(e) }; }
+  gitBusy = false;
+  renderScm(); renderBranch(); decorateTree();
+  if (gitAgain) { gitAgain = false; refreshGit(); }
+}
+// Terminal output and file events arrive in bursts; refresh at most every few seconds.
+function scheduleGit() {
+  if (gitTimer) return;
+  gitTimer = setTimeout(() => { gitTimer = null; refreshGit(); }, Math.max(400, 2500 - (Date.now() - gitLast)));
+}
+window.addEventListener("focus", () => refreshGit());
+
+function groupsOf(files) {
+  const conflict = [], staged = [], changes = [];
+  for (const f of files) {
+    if (f.x === "U" || f.y === "U" || (f.x === "A" && f.y === "A") || (f.x === "D" && f.y === "D")) { conflict.push({ ...f, st: "!" }); continue; }
+    if (f.x !== " " && f.x !== "?") staged.push({ ...f, st: f.x });
+    if (f.y !== " ") changes.push({ ...f, st: f.y === "?" ? "U" : f.y, untracked: f.y === "?" });
+  }
+  return { conflict, staged, changes };
+}
+const ICON = {
+  open: '<svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M4 1.8h5l3 3v9.4H4z" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>',
+  stage: '<svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M8 3v10M3 8h10" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>',
+  unstage: '<svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M3 8h10" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>',
+  discard: '<svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M3.5 6.5h6a3.5 3.5 0 0 1 0 7H6M3.5 6.5 6 4M3.5 6.5 6 9" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+};
+const actBtn = (act, title) => `<button type="button" data-a="${act}" title="${title}" aria-label="${title}">${ICON[act]}</button>`;
+function renderScm() {
+  const g = state.git || {};
+  const n = (g.files || []).length;
+  $("scmBadge").hidden = !g.repo || !n;
+  $("scmBadge").textContent = n > 999 ? "999+" : n;
+  $("scmNoRepo").hidden = !!g.repo;
+  $("scmMain").hidden = !g.repo;
+  if (!g.repo) { $("scmNoRepoText").textContent = g.error || `${base(state.workspace) || "This folder"} isn't a git repository.`; return; }
+
+  const { conflict, staged, changes } = groupsOf(g.files);
+  $("commitBtn").textContent = $("amendChk").checked ? "Amend last commit" : staged.length ? `Commit ${staged.length} staged` : "Commit";
+  const rows = (list, group) => list.map((f) => {
+    const slash = f.path.lastIndexOf("/");
+    const acts = group === "staged" ? actBtn("open", "Open file") + actBtn("unstage", "Unstage")
+      : group === "conflict" ? actBtn("open", "Open file") + actBtn("stage", "Mark resolved (stage)")
+      : actBtn("open", "Open file") + actBtn("discard", "Discard changes") + actBtn("stage", "Stage");
+    return `<div class="scm-row" tabindex="0" data-g="${group}" data-path="${esc(f.path)}" data-st="${esc(f.st)}"${f.untracked ? ' data-new="1"' : ""} title="${esc(f.orig ? f.orig + " → " + f.path : f.path)}"><span class="dot" style="background:${DOT[ext(f.path)] || "var(--faint)"}"></span><span class="nm${f.st === "D" ? " del" : ""}">${esc(f.path.slice(slash + 1))}</span><small>${esc(slash > 0 ? f.path.slice(0, slash) : "")}</small><span class="scm-acts">${acts}</span><span class="st ${f.st === "!" ? "st-conflict" : "st-" + f.st}">${esc(f.st)}</span></div>`;
+  }).join("");
+  const head = (key, title, count, acts = "") => `<div class="scm-group${scmCollapsed.has(key) ? "" : " open"}" data-key="${key}" role="button" tabindex="0">${CHEV}<span>${title}</span><span class="count">${count}</span><span class="grow"></span><span class="scm-acts">${acts}</span></div>`;
+  let html = "";
+  if (conflict.length) html += head("conflict", "Merge Changes", conflict.length) + (scmCollapsed.has("conflict") ? "" : rows(conflict, "conflict"));
+  if (staged.length) html += head("staged", "Staged Changes", staged.length, actBtn("unstage", "Unstage all")) + (scmCollapsed.has("staged") ? "" : rows(staged, "staged"));
+  html += head("changes", "Changes", changes.length, changes.length ? actBtn("discard", "Discard all changes") + actBtn("stage", "Stage all changes") : "") + (scmCollapsed.has("changes") ? "" : changes.length ? rows(changes, "changes") : `<div class="scm-empty">${staged.length ? "Everything is staged." : "No changes. Working tree clean."}</div>`);
+  html += head("commits", "Commits", g.commits.length) + (scmCollapsed.has("commits") ? "" : g.commits.length
+    ? g.commits.map((c) => `<div class="commit-row" title="${esc(c.hash)}\n${esc(c.subject)}"><span class="subj">${esc(c.subject)}</span><small><code>${esc(c.short)}</code> · ${esc(c.author)} · ${esc(c.when)}</small></div>`).join("")
+    : `<div class="scm-empty">No commits yet.</div>`);
+  const list = $("scmList"), top = list.scrollTop;
+  list.innerHTML = html;
+  list.scrollTop = top;
+  const sel = state.pending && state.pending.gitKey;
+  if (sel) list.querySelectorAll(".scm-row").forEach((r) => r.classList.toggle("sel", r.dataset.g + ":" + r.dataset.path === sel));
+}
+function renderBranch() {
+  const g = state.git || {};
+  const st = $("stBranch");
+  st.hidden = !g.repo;
+  if (!g.repo) return;
+  const BR = '<svg width="12" height="12" viewBox="0 0 16 16" fill="none" aria-hidden="true"><circle cx="4.5" cy="3.5" r="1.7" stroke="currentColor" stroke-width="1.4"/><circle cx="4.5" cy="12.5" r="1.7" stroke="currentColor" stroke-width="1.4"/><circle cx="11.5" cy="5.5" r="1.7" stroke="currentColor" stroke-width="1.4"/><path d="M4.5 5.2v5.6M11.5 7.2c0 2.6-2.2 3-5.6 4.2" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>';
+  const sync = (g.behind ? ` ↓${g.behind}` : "") + (g.ahead ? ` ↑${g.ahead}` : "");
+  st.innerHTML = `${BR}${esc(g.branch || "?")}${(g.files.length ? "*" : "")}${sync}`;
+  $("scmBranch").innerHTML = `${BR}<span>${esc(g.branch || "?")}</span>${g.upstream ? `<small style="color:var(--faint)">→ ${esc(g.upstream)}</small>` : ""}`;
+  const sb = $("gitSync");
+  if (!g.upstream) { sb.textContent = "Publish"; sb.title = g.remotes.length ? `Push ${g.branch} to ${g.remotes.includes("origin") ? "origin" : g.remotes[0]}` : "Add a remote first"; sb.disabled = !g.remotes.length; }
+  else { sb.textContent = `↓${g.behind} ↑${g.ahead}`; sb.title = `Sync with ${g.upstream}: pull, then push`; sb.disabled = false; }
+}
+function decorateTree() {
+  const g = state.git;
+  const rows = treeEl.querySelectorAll(".row");
+  rows.forEach((r) => r.classList.remove("g-M", "g-A", "g-U", "g-D", "g-C", "g-dir"));
+  if (!g || !g.repo || !g.files.length) return;
+  const files = new Map(), dirs = new Set();
+  for (const f of g.files) {
+    const conflict = groupsOf([f]).conflict.length;
+    const st = conflict ? "C" : f.y === "?" ? "U" : f.y !== " " ? f.y : f.x;
+    const abs = g.repo + "/" + f.path;
+    files.set(abs, st);
+    for (let d = parentOf(abs); d.length > g.repo.length; d = parentOf(d)) dirs.add(d);
+  }
+  rows.forEach((r) => {
+    const st = files.get(r.dataset.path);
+    if (st) r.classList.add("g-" + (st === "R" ? "M" : st));
+    else if (r.dataset.dir && dirs.has(r.dataset.path)) r.classList.add("g-dir");
+  });
+}
+
+async function gitDo(fn, done) {
+  try { const r = await fn(); if (done) toast(done); return r; }
+  catch (e) { toast(errMsg(e).split("\n").filter(Boolean).slice(-2).join(" ")); return undefined; }
+  finally { refreshGit(); }
+}
+// After git rewrites files (pull, checkout, discard) the open tabs and tree follow.
+async function afterGitWrite() {
+  await Promise.all(state.tabs.map((t) => reloadFromDisk(t.path)));
+  state.fileIndex = null;
+  renderTree();
+}
+async function openGitDiff(path, staged) {
+  const g = state.git;
+  let d;
+  try { d = await api.git.diff(path, staged); } catch (e) { return toast(errMsg(e)); }
+  if (d.binary) return toast(`${base(path)} is a binary file`);
+  const key = (staged ? "staged:" : "changes:") + path;
+  showDiff({
+    path: d.path, before: d.before, after: d.after, standalone: true, gitKey: key,
+    label: `${base(path)} · ${staged ? "Staged" : "Working tree"} (${g.repo === state.workspace ? path : g.repo.split("/").pop() + "/" + path})`,
+    acceptLabel: staged ? "Unstage" : "Stage", rejectLabel: "Close",
+    onAccept: () => gitDo(() => (staged ? api.git.unstage([path]) : api.git.stage([path]))),
+    onReject: () => renderScm(),
+  });
+  renderScm();
+}
+$("scmList").addEventListener("click", async (e) => {
+  const grp = e.target.closest(".scm-group");
+  const act = e.target.closest("[data-a]");
+  const { conflict, staged, changes } = groupsOf((state.git && state.git.files) || []);
+  if (grp && act) {
+    const key = grp.dataset.key, a = act.dataset.a;
+    if (key === "staged" && a === "unstage") gitDo(() => api.git.unstage(staged.map((f) => f.path)));
+    else if (key === "changes" && a === "stage") gitDo(() => api.git.stage(changes.map((f) => f.path)));
+    else if (key === "changes" && a === "discard") {
+      const ok = await gitDo(() => api.git.discard(changes.filter((f) => !f.untracked).map((f) => f.path), changes.filter((f) => f.untracked).map((f) => f.path)));
+      if (ok) afterGitWrite();
+    }
+    return;
+  }
+  if (grp) { const k = grp.dataset.key; scmCollapsed.has(k) ? scmCollapsed.delete(k) : scmCollapsed.add(k); renderScm(); return; }
+  const row = e.target.closest(".scm-row"); if (!row) return;
+  const path = row.dataset.path, group = row.dataset.g, abs = state.git.repo + "/" + path;
+  if (!act) return openGitDiff(path, group === "staged");
+  if (act.dataset.a === "open") { if (row.dataset.st === "D") toast(`${base(path)} was deleted`); else openFile(abs); }
+  else if (act.dataset.a === "stage") gitDo(() => api.git.stage([path]));
+  else if (act.dataset.a === "unstage") gitDo(() => api.git.unstage([path]));
+  else if (act.dataset.a === "discard") {
+    const ok = await gitDo(() => (row.dataset.new ? api.git.discard([], [path]) : api.git.discard([path], [])));
+    if (ok) { if (state.pending && state.pending.gitKey === group + ":" + path) { state.pending = null; renderDiff(); } afterGitWrite(); }
+  }
+});
+$("scmList").addEventListener("keydown", (e) => { if (e.key === "Enter" && e.target.matches(".scm-row, .scm-group")) { e.preventDefault(); e.target.click(); } });
+
+async function commit() {
+  const msg = $("commitMsg").value.trim();
+  if (!msg) { toast("Write a commit message first, or press Generate"); $("commitMsg").focus(); return; }
+  const amend = $("amendChk").checked;
+  const ok = await gitDo(() => api.git.commit(msg, amend));
+  if (ok) { $("commitMsg").value = ""; $("amendChk").checked = false; toast(amend ? "Amended the last commit" : "Committed"); if (state.pending && state.pending.standalone) { state.pending = null; renderDiff(); } }
+}
+$("commitBtn").onclick = commit;
+$("amendChk").onchange = renderScm;
+$("commitMsg").addEventListener("keydown", (e) => { if ((e.metaKey || e.ctrlKey) && e.key === "Enter") { e.preventDefault(); commit(); } });
+$("genMsg").onclick = async () => {
+  if (!state.info.connected) return openSettings();
+  const b = $("genMsg"), label = b.querySelector("span");
+  b.disabled = true; label.textContent = "Writing…";
+  try { $("commitMsg").value = await api.git.message(); $("commitMsg").focus(); }
+  catch (e) { toast(errMsg(e)); }
+  finally { b.disabled = false; label.textContent = "Generate"; }
+};
+$("gitRefresh").onclick = () => refreshGit();
+$("gitFetch").onclick = () => gitDo(() => api.git.fetch(), "Fetched");
+$("gitPull").onclick = async () => { const r = await gitDo(() => api.git.pull(), "Pulled"); if (r !== undefined) afterGitWrite(); };
+$("gitPush").onclick = () => gitDo(() => api.git.push(), "Pushed");
+$("gitSync").onclick = async () => {
+  const g = state.git; if (!g || !g.repo) return;
+  if (!g.upstream) return gitDo(() => api.git.push(), `Published ${g.branch}`);
+  $("gitSync").disabled = true;
+  try {
+    if (g.behind) { await api.git.pull(); await afterGitWrite(); }
+    await api.git.push();
+    toast("Synced with " + g.upstream);
+  } catch (e) { toast(errMsg(e).split("\n").filter(Boolean).slice(-2).join(" ")); }
+  finally { $("gitSync").disabled = false; refreshGit(); }
+};
+$("gitInit").onclick = () => gitDo(() => api.git.init(), "Initialized a git repository");
+$("scmOpenFolder").onclick = chooseFolder;
+
+// Branch picker, in the same style as ⌘P.
+async function openBranchPicker() {
+  let all;
+  try { all = await api.git.branches(); } catch (e) { return toast(errMsg(e)); }
+  const ov = document.createElement("div");
+  ov.className = "overlay";
+  ov.innerHTML = `<div class="palette" role="dialog" aria-label="Switch branch"><input placeholder="Switch to a branch, or type a name to create one" aria-label="Branch name"><div class="items"></div></div>`;
+  document.body.appendChild(ov);
+  const inp = ov.querySelector("input"), items = ov.querySelector(".items");
+  let sel = 0, list = [];
+  const close = () => ov.remove();
+  const draw = () => {
+    const q = inp.value.trim();
+    list = all.filter((b) => b.name.toLowerCase().includes(q.toLowerCase())).map((b) => ({ ...b }));
+    if (q && !all.some((b) => b.name === q)) list.unshift({ name: q, create: true });
+    sel = Math.min(sel, Math.max(0, list.length - 1));
+    items.innerHTML = list.map((b, i) => `<button type="button" class="it${i === sel ? " sel" : ""}" data-i="${i}">${b.create ? "+ Create branch " : ""}${esc(b.name)}<small>${b.current ? "current" : b.create ? "from " + esc(state.git.branch || "HEAD") : b.name.includes("/") && !all.some((x) => x.name === b.name.split("/").slice(1).join("/")) ? "remote" : ""}</small></button>`).join("") || `<div class="empty">No branches</div>`;
+  };
+  const pick = async (b) => {
+    close();
+    if (!b || b.current) return;
+    const r = await gitDo(() => api.git.checkout(b.name, !!b.create), b.create ? `Created ${b.name}` : `Switched to ${b.name}`);
+    if (r !== undefined) afterGitWrite();
+  };
+  inp.oninput = () => { sel = 0; draw(); };
+  inp.onkeydown = (e) => {
+    if (e.key === "ArrowDown") { sel = Math.min(list.length - 1, sel + 1); draw(); e.preventDefault(); }
+    else if (e.key === "ArrowUp") { sel = Math.max(0, sel - 1); draw(); e.preventDefault(); }
+    else if (e.key === "Enter") pick(list[sel]);
+    else if (e.key === "Escape") close();
+  };
+  items.onclick = (e) => { const b = e.target.closest("[data-i]"); if (b) pick(list[+b.dataset.i]); };
+  ov.onclick = (e) => { if (e.target === ov) close(); };
+  draw(); inp.focus();
+}
+$("scmBranch").onclick = openBranchPicker;
+$("stBranch").onclick = openBranchPicker;
+
+/* ---------- chats: tabs in the Claude panel, each with its own agent ---------- */
+const chatUI = {};   // id → { el, reply, loaded, unread }
+function chatEl(id) {
+  if (!chatUI[id]) {
+    const el = document.createElement("div");
+    el.className = "log";
+    el.hidden = true;
+    $("logs").appendChild(el);
+    chatUI[id] = { el, reply: null, loaded: false, unread: false };
+  }
+  return chatUI[id];
+}
+// Draw into another chat's log (a background agent's events) without disturbing the visible one.
+function inChat(id, fn) {
+  if (!id || id === state.chat) return fn();
+  const c = chatEl(id), keepLog = log, keepReply = reply;
+  log = c.el; reply = c.reply;
+  try { return fn(); } finally { c.reply = reply; log = keepLog; reply = keepReply; }
+}
+async function switchChat(id) {
+  if (state.chat && chatUI[state.chat]) chatUI[state.chat].reply = reply;
+  state.chat = id;
+  const c = chatEl(id);
+  Object.values(chatUI).forEach((o) => { o.el.hidden = o !== c; });
+  log = c.el; reply = c.reply; c.unread = false;
+  try { localStorage.setItem("lumen.chat", id); } catch {}
+  renderChatTabs(); updateSend();
+  if (!c.loaded) { c.loaded = true; await restoreChat(id); }
+}
+function setRunning(id, running) {
+  const ch = state.chats.find((c) => c.id === id);
+  if (ch) ch.running = running;
+  renderChatTabs(); updateSend();
+}
+const pendingApprovals = (id) => (chatUI[id] ? chatUI[id].el.querySelectorAll(".approval:not(.resolved)").length : 0);
+function chatState(ch) {
+  if (ch.running && pendingApprovals(ch.id)) return { cls: "wait", label: "Waiting for your approval" };
+  if (ch.running) return { cls: "run", label: "Working…" };
+  if (chatUI[ch.id] && chatUI[ch.id].unread) return { cls: "unread", label: "Finished" };
+  return { cls: "", label: "" };
+}
+function renderChatTabs() {
+  const open = state.chats.filter((c) => !c.closed);
+  $("chatTabs").innerHTML = open.map((ch) => {
+    const st = chatState(ch);
+    return `<div class="chat-tab${ch.id === state.chat ? " active" : ""}" role="tab" aria-selected="${ch.id === state.chat}" data-id="${esc(ch.id)}" title="${esc(ch.title)}${st.label ? " · " + st.label : ""}"><span class="cstate ${st.cls}"></span><button type="button" class="nm">${esc(ch.title)}</button><button type="button" class="x" aria-label="Close ${esc(ch.title)}"><svg width="9" height="9" viewBox="0 0 10 10" aria-hidden="true"><path d="M2 2l6 6M8 2l-6 6" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg></button></div>`;
+  }).join("");
+  const act = $("chatTabs").querySelector(".active");
+  if (act) act.scrollIntoView({ block: "nearest", inline: "nearest" });
+}
+let closeArmed = null;
+$("chatTabs").addEventListener("click", async (e) => {
+  const t = e.target.closest(".chat-tab"); if (!t) return;
+  const id = t.dataset.id, ch = state.chats.find((c) => c.id === id);
+  if (!e.target.closest(".x")) return switchChat(id);
+  if (ch && ch.running && closeArmed !== id) {
+    closeArmed = id; setTimeout(() => { if (closeArmed === id) closeArmed = null; }, 4000);
+    return toast("Claude is still working in this chat. Close it again to stop it.");
+  }
+  closeArmed = null;
+  const open = state.chats.filter((c) => !c.closed);
+  const i = open.findIndex((c) => c.id === id);
+  await api.chats.close(id);
+  if (id === state.chat) {
+    const list = await api.chats.list();
+    applyChats(list);
+    const rest = list.filter((c) => !c.closed);
+    switchChat((rest[Math.min(i, rest.length - 1)] || rest[0]).id);
+  }
+});
+function applyChats(list) {
+  state.chats = list;
+  if (state.chat && !list.some((c) => c.id === state.chat && !c.closed)) {
+    const next = list.find((c) => !c.closed);
+    if (next) switchChat(next.id);
+  }
+  renderChatTabs(); updateSend();
+}
+api.chats.onChange(applyChats);
+async function newChat() {
+  // An untouched chat is already a new one.
+  const cur = state.chats.find((c) => c.id === state.chat);
+  if (cur && !cur.used && !cur.running) { promptEl.focus(); return; }
+  const id = await api.chats.create();
+  applyChats(await api.chats.list());
+  await switchChat(id);
+  promptEl.focus();
+}
+$("newChatBtn").onclick = newChat;
+async function initChats() {
+  state.chats = await api.chats.list();
+  let want = null;
+  try { want = localStorage.getItem("lumen.chat"); } catch {}
+  const open = state.chats.filter((c) => !c.closed);
+  await switchChat((open.find((c) => c.id === want) || open[open.length - 1]).id);
+}
+// Every chat, including closed ones, newest first.
+$("chatHistory").onclick = () => {
+  const ov = document.createElement("div");
+  ov.className = "overlay";
+  ov.innerHTML = `<div class="palette" role="dialog" aria-label="All chats"><input placeholder="Search chats" aria-label="Search chats"><div class="items"></div></div>`;
+  document.body.appendChild(ov);
+  const inp = ov.querySelector("input"), items = ov.querySelector(".items");
+  let sel = 0, list = [];
+  const ago = (t) => { const m = Math.round((Date.now() - t) / 60000); return m < 1 ? "just now" : m < 60 ? m + " min ago" : m < 1440 ? Math.round(m / 60) + " h ago" : Math.round(m / 1440) + " d ago"; };
+  const close = () => ov.remove();
+  const draw = () => {
+    const q = inp.value.trim().toLowerCase();
+    list = [...state.chats].filter((c) => c.used || c.id === state.chat).filter((c) => c.title.toLowerCase().includes(q)).sort((a, b) => b.updatedAt - a.updatedAt);
+    sel = Math.min(sel, Math.max(0, list.length - 1));
+    items.innerHTML = list.map((c, i) => `<div class="it${i === sel ? " sel" : ""}" data-i="${i}" role="option"><span class="cstate ${chatState(c).cls}"></span>${esc(c.title)}<small>${c.closed ? "closed · " : ""}${ago(c.updatedAt)}</small><button type="button" class="del" title="Delete chat" aria-label="Delete ${esc(c.title)}">×</button></div>`).join("") || `<div class="empty">No chats yet</div>`;
+  };
+  const pick = async (c) => {
+    close();
+    if (!c) return;
+    if (c.closed) { await api.chats.reopen(c.id); applyChats(await api.chats.list()); }
+    switchChat(c.id);
+  };
+  inp.oninput = () => { sel = 0; draw(); };
+  inp.onkeydown = (e) => {
+    if (e.key === "ArrowDown") { sel = Math.min(list.length - 1, sel + 1); draw(); e.preventDefault(); }
+    else if (e.key === "ArrowUp") { sel = Math.max(0, sel - 1); draw(); e.preventDefault(); }
+    else if (e.key === "Enter") pick(list[sel]);
+    else if (e.key === "Escape") close();
+  };
+  items.onclick = async (e) => {
+    const row = e.target.closest("[data-i]"); if (!row) return;
+    const c = list[+row.dataset.i];
+    if (e.target.closest(".del")) {
+      if (c.running) return toast("Stop this chat before deleting it");
+      await api.chats.remove(c.id);
+      if (chatUI[c.id]) { chatUI[c.id].el.remove(); delete chatUI[c.id]; }
+      applyChats(await api.chats.list());
+      return draw();
+    }
+    pick(c);
+  };
+  ov.onclick = (e) => { if (e.target === ov) close(); };
+  draw(); inp.focus();
+};
 
 /* ---------- boot ---------- */
 (async () => {
   state.info = await api.info();
   syncModel(); setStatus();
   await setWorkspace(state.info.workspace);
-  renderTabs(); renderEditor(); welcome();
+  renderTabs(); renderEditor(); await initChats();
   if (!state.info.connected) openSettings();
 })();
 })();

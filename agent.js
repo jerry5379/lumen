@@ -145,6 +145,18 @@ class Agent {
     if (this.controller) this.controller.abort();
   }
 
+  // Saved between launches so Claude remembers the chat. "Always allow" is not saved.
+  snapshot() {
+    return { messages: this.messages };
+  }
+
+  restore(state) {
+    if (!state || !Array.isArray(state.messages)) return;
+    this.messages = state.messages;
+    // The app may have quit mid-turn.
+    this.repairAfterAbort();
+  }
+
   client() {
     const apiKey = this.getApiKey();
     if (apiKey) return new Anthropic({ apiKey });
@@ -350,7 +362,6 @@ class Agent {
 
   // ⌘K: rewrite a snippet in one call, no tools.
   async inlineEdit({ path: file, before, selection, after, instruction }) {
-    const client = this.client();
     const prompt = `You are editing ${file} inside a code editor.
 
 Instruction: ${instruction}
@@ -371,16 +382,21 @@ ${after.slice(0, 6000)}
 </after>
 
 Reply with only the replacement for the selected code, keeping its indentation style. No explanation, no code fences.`;
+    const text = await this.complete(prompt);
+    return text.replace(/^\s*```[^\n]*\n/, "").replace(/\n?```\s*$/, "");
+  }
+
+  // One call outside the chat, no tools (⌘K, commit messages).
+  async complete(prompt) {
+    const client = this.client();
     const msg = await client.messages.stream({
       model: this.getModel(),
       max_tokens: 32000,
       output_config: { effort: "medium" },
       messages: [{ role: "user", content: prompt }],
     }).finalMessage();
-    if (msg.stop_reason === "refusal") throw new Error("Claude declined this edit.");
-    let text = msg.content.filter((b) => b.type === "text").map((b) => b.text).join("");
-    text = text.replace(/^\s*```[^\n]*\n/, "").replace(/\n?```\s*$/, "");
-    return text;
+    if (msg.stop_reason === "refusal") throw new Error("Claude declined this request.");
+    return msg.content.filter((b) => b.type === "text").map((b) => b.text).join("");
   }
 }
 
