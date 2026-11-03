@@ -33,12 +33,13 @@ function runAnt(args) {
 let loginInFlight = null;
 
 const SETTINGS_FILE = () => path.join(app.getPath("userData"), "settings.json");
-const MODELS = ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"];
+const MODELS = ["claude-fable-5-1", "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"];
+const DEFAULT_MODEL = "claude-opus-5-5";
 const TITLE_MODEL = "claude-haiku-5-5"; // chat titles are short; the fastest model is plenty
 const TRASH_DAYS = 30;                   // deleted chats stay restorable this long
 
 let win;
-let settings = { model: MODELS[0], workspace: os.homedir(), apiKeyEnc: null, apiKeyPlain: null, engine: "claude-code", mode: "manual" };
+let settings = { model: DEFAULT_MODEL, workspace: os.homedir(), apiKeyEnc: null, apiKeyPlain: null, engine: "claude-code", mode: "manual" };
 
 function loadSettings() {
   try { settings = { ...settings, ...JSON.parse(fs.readFileSync(SETTINGS_FILE(), "utf8")) }; } catch {}

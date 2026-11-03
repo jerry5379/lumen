@@ -1324,7 +1324,7 @@ function openSettings() {
   $("setSave").focus();
 }
 document.querySelectorAll('input[name="engine"]').forEach((r) => r.onchange = () => { chosenEngine = r.value; renderAuth(); });
-const modelName = (m) => ({ "claude-opus-5-5": "Claude Opus 5.5 (best)", "claude-sonnet-5-5": "Claude Sonnet 5.5 (faster)", "claude-haiku-5-5": "Claude Haiku 5.5 (fastest)" }[m] || m);
+const modelName = (m) => ({ "claude-fable-5-1": "Claude Fable 5.1 (most capable)", "claude-opus-5-5": "Claude Opus 5.5 (best)", "claude-sonnet-5-5": "Claude Sonnet 5.5 (faster)", "claude-haiku-5-5": "Claude Haiku 5.5 (fastest)" }[m] || m);
 $("settingsBtn").onclick = openSettings;
 $("setCancel").onclick = () => { $("settings").hidden = true; };
 

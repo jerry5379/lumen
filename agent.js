@@ -216,8 +216,8 @@ class Agent {
       output_config: { effort: "high" },
       cache_control: { type: "ephemeral" },
     };
-    // Server-side refusal fallback for Opus/Sonnet 5.5 on the Claude API.
-    if (/opus|sonnet/.test(model)) {
+    // Server-side refusal fallback for Fable/Opus/Sonnet on the Claude API.
+    if (/fable|opus|sonnet/.test(model)) {
       params.betas = ["server-side-fallback-2026-07-01"];
       params.fallbacks = "default";
     }
