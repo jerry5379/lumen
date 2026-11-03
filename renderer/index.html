@@ -25,6 +25,7 @@
     <aside class="explorer" aria-label="Sidebar">
       <div class="views" role="tablist" aria-label="Sidebar views">
         <button class="view-tab active" type="button" role="tab" data-view="files" title="Explorer (⇧⌘E)" aria-label="Explorer"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M4 1.8h5l3 3v9.4H4z" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/><path d="M9 1.8v3h3" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg></button>
+        <button class="view-tab" type="button" role="tab" data-view="run" title="Run & Debug (⇧⌘D)" aria-label="Run and Debug"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M4.5 2.8v10.4l8.5-5.2z" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg><span class="badge run" id="runBadge" hidden></span></button>
         <button class="view-tab" type="button" role="tab" data-view="scm" title="Source Control (⌃⇧G)" aria-label="Source Control"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><circle cx="4.5" cy="3.5" r="1.7" stroke="currentColor" stroke-width="1.4"/><circle cx="4.5" cy="12.5" r="1.7" stroke="currentColor" stroke-width="1.4"/><circle cx="11.5" cy="5.5" r="1.7" stroke="currentColor" stroke-width="1.4"/><path d="M4.5 5.2v5.6M11.5 7.2c0 2.6-2.2 3-5.6 4.2" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg><span class="badge" id="scmBadge" hidden></span></button>
       </div>
       <div class="view" id="filesView">
@@ -72,18 +73,31 @@
           <div class="scm-list" id="scmList"></div>
         </div>
       </div>
+      <div class="view" id="runView" hidden>
+        <div class="pane-head">
+          <span>Run &amp; Debug</span>
+          <span>
+            <button class="icon-btn" id="runAdd" type="button" title="Edit configurations (.lumen/launch.json)" aria-label="Edit run configurations"><svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M8 3v10M3 8h10" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button>
+            <button class="icon-btn" id="runRefresh" type="button" title="Detect again" aria-label="Refresh run configurations"><svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M3 8a5 5 0 1 0 1.5-3.6M3 2.5v2.5h2.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+          </span>
+        </div>
+        <div class="run-list" id="runList"></div>
+      </div>
       <div class="resizer" id="resizeLeft" role="separator" aria-orientation="vertical" aria-label="Resize explorer" title="Drag to resize · double-click to reset"></div>
     </aside>
 
     <section class="editor-col" aria-label="Editor">
       <div class="tabs" id="tabs"></div>
       <div class="crumbs" id="crumbs"></div>
+      <div class="cf-bar" id="cfBar" hidden role="status"></div>
       <div class="stage">
         <div class="code" id="codeWrap" hidden>
           <div class="gutter"><div class="gutter-inner" id="gutter"></div></div>
           <div class="scroller">
+            <div class="cf-layer" id="cfBg" aria-hidden="true"></div>
             <pre class="hl" id="hl" aria-hidden="true"></pre>
             <textarea id="ta" spellcheck="false" autocapitalize="off" autocomplete="off" wrap="off" aria-label="Code editor"></textarea>
+            <div class="cf-layer cf-top" id="cfActs"></div>
           </div>
         </div>
         <div class="empty-editor" id="emptyEditor">
@@ -95,6 +109,7 @@
               <span class="kbd">⌘K</span><span>Edit selection with Claude</span>
               <span class="kbd">⌘L</span><span>Ask Claude about anything on this Mac</span>
               <span class="kbd">⌘S</span><span>Save file</span>
+              <span class="kbd">⇧⌘D</span><span>Run &amp; Debug: start the project's servers</span>
             </div>
           </div>
         </div>
@@ -138,19 +153,29 @@
         <span class="chat-title">Claude</span>
         <span class="scope" title="Claude can explore your whole computer with tools">System access</span>
         <div class="grow"></div>
-        <button class="icon-btn" id="chatHistory" type="button" title="All chats" aria-label="All chats"><svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true"><circle cx="8" cy="8" r="5.8" stroke="currentColor" stroke-width="1.4"/><path d="M8 4.8V8l2.2 1.4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+        <button class="icon-btn" id="chatFindBtn" type="button" title="Find in this chat (⌘F)" aria-label="Find in chat"><svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true"><circle cx="7" cy="7" r="4.2" stroke="currentColor" stroke-width="1.5"/><path d="M10.2 10.2 14 14" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button>
+        <button class="icon-btn" id="chatHistory" type="button" title="All chats · search every chat" aria-label="All chats"><svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true"><circle cx="8" cy="8" r="5.8" stroke="currentColor" stroke-width="1.4"/><path d="M8 4.8V8l2.2 1.4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
         <button class="icon-btn" id="newChatBtn" type="button" title="New chat (⌘T)" aria-label="New chat"><svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M8 3v10M3 8h10" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button>
       </div>
       <div class="chat-tabs" id="chatTabs" role="tablist" aria-label="Chats"></div>
+      <div class="chat-find" id="chatFind" hidden>
+        <input id="findInput" placeholder="Find in chat…" aria-label="Find in chat">
+        <span class="count" id="findCount"></span>
+        <button class="icon-btn" id="findPrev" type="button" title="Previous (⇧↵)" aria-label="Previous match">↑</button>
+        <button class="icon-btn" id="findNext" type="button" title="Next (↵)" aria-label="Next match">↓</button>
+        <button class="icon-btn" id="findClose" type="button" title="Close (Esc)" aria-label="Close find"><svg width="12" height="12" viewBox="0 0 10 10" aria-hidden="true"><path d="M2 2l6 6M8 2l-6 6" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg></button>
+      </div>
       <div class="resizer left" id="resizeRight" role="separator" aria-orientation="vertical" aria-label="Resize chat" title="Drag to resize · double-click to reset"></div>
       <div class="logs" id="logs"></div>
       <div class="dropzone" id="dropzone" hidden><div>Drop files or folders to attach</div></div>
       <div class="composer">
         <div class="mention" id="mention" hidden role="listbox" aria-label="Attach a file"></div>
         <div class="ctxbar" id="ctxbar"></div>
+        <div class="attach-strip" id="attachStrip" hidden></div>
         <div class="box">
           <textarea id="prompt" placeholder="Ask anything · @ to attach a file · drop files here" aria-label="Message Claude"></textarea>
           <div class="box-foot">
+            <select id="mode" aria-label="Chat mode" title="How much Claude may do on its own in this chat (⌘. to switch)"></select>
             <select id="model" aria-label="Model"></select>
             <div class="grow"></div>
             <button class="send" id="send" type="button" aria-label="Send" disabled>
@@ -165,6 +190,7 @@
   <footer class="status">
     <button type="button" class="st-btn" id="stBranch" title="Switch branch" hidden></button>
     <button type="button" class="st-btn" id="stTerm" title="Toggle terminal (⌃`)"><svg width="12" height="12" viewBox="0 0 16 16" fill="none" aria-hidden="true"><rect x="1.5" y="2.5" width="13" height="11" rx="2" stroke="currentColor" stroke-width="1.4"/><path d="M4.5 6l2 2-2 2M8.5 10.5h3" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>Terminal</button>
+    <button type="button" class="st-btn" id="stRun" title="Run & Debug (⇧⌘D)" hidden><svg width="11" height="11" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M4.5 2.8v10.4l8.5-5.2z" fill="currentColor"/></svg><span></span></button>
     <span id="stCursor">Ln 1, Col 1</span>
     <span id="stLang"></span>
     <span class="grow"></span>

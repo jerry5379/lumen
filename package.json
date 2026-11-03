@@ -1,6 +1,6 @@
 {
   "name": "lumen",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "A desktop AI code editor powered by Claude, with access to your whole system",
   "main": "main.js",
   "scripts": {

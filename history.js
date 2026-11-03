@@ -17,19 +17,25 @@ class ChatStore {
     return { version: 1, transcript: [], engines: {} };
   }
 
-  load() {
+  // Read a chat file without keeping it: for search and for rebuilding the index.
+  static read(file) {
     try {
-      const d = JSON.parse(fs.readFileSync(this.file, "utf8"));
-      if (d && d.version === 1 && Array.isArray(d.transcript)) this.data = { ...ChatStore.empty(), ...d };
-    } catch {}
+      const d = JSON.parse(fs.readFileSync(file, "utf8"));
+      return d && d.version === 1 && Array.isArray(d.transcript) ? d : null;
+    } catch { return null; }
+  }
+
+  load() {
+    const d = ChatStore.read(this.file);
+    if (d) this.data = { ...ChatStore.empty(), ...d };
     return this.data;
   }
 
   engine(name) { return this.data.engines[name] || null; }
   setEngine(name, state) { this.data.engines[name] = state; this.save(); }
 
-  user(text, ctx) {
-    this.data.transcript.push({ type: "user", text, ctx: ctx || "" });
+  user(text, ctx, images) {
+    this.data.transcript.push({ type: "user", text, ctx: ctx || "", ...(images && images.length ? { images } : {}) });
     this.save();
   }
 
@@ -50,6 +56,27 @@ class ChatStore {
       t.push(ev);
     }
     if (ev.type === "done") this.flush(); else this.save();
+  }
+
+  // The user messages in order, each with the text Claude replied with.
+  turns() {
+    const out = [];
+    for (const e of this.data.transcript) {
+      if (e.type === "user") out.push({ text: e.text, ctx: e.ctx, images: e.images || [], reply: "" });
+      else if (e.type === "text" && out.length) out[out.length - 1].reply += e.delta;
+    }
+    return out;
+  }
+
+  // Drop everything from the user message numbered `turn` on (going back to edit a message).
+  truncate(turn) {
+    const t = this.data.transcript;
+    let n = -1;
+    const at = t.findIndex((e) => e.type === "user" && ++n === turn);
+    if (at < 0) return false;
+    t.length = at;
+    this.flush();
+    return true;
   }
 
   clear() {
@@ -76,4 +103,26 @@ class ChatStore {
   }
 }
 
-module.exports = { ChatStore };
+// Case-insensitive search of a transcript: how many places match and a snippet around the first.
+function searchTranscript(transcript, query) {
+  const q = query.toLowerCase();
+  let count = 0, snippet = null;
+  for (const e of transcript) {
+    const text = e.type === "user" ? e.text : e.type === "text" ? e.delta : null;
+    if (!text) continue;
+    const lower = text.toLowerCase();
+    let i = lower.indexOf(q);
+    while (i >= 0) {
+      count++;
+      if (!snippet) {
+        const s = Math.max(0, i - 40), end = Math.min(text.length, i + q.length + 60);
+        snippet = (s > 0 ? "…" : "") + text.slice(s, end).replace(/\s+/g, " ") + (end < text.length ? "…" : "");
+      }
+      i = lower.indexOf(q, i + q.length);
+      if (count > 999) break;
+    }
+  }
+  return count ? { count, snippet } : null;
+}
+
+module.exports = { ChatStore, searchTranscript };

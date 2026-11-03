@@ -6,6 +6,7 @@ const fsp = require("fs/promises");
 const path = require("path");
 const os = require("os");
 const { spawn, execFileSync } = require("child_process");
+const { MODES, risky } = require("./agent");
 
 // Apps opened from Finder get a minimal PATH; give Claude Code (and its Bash tool) the usual one.
 const NVM_BINS = (() => {
@@ -93,15 +94,25 @@ const logout = () => runClaude(["auth", "logout"]);
 let sdkPromise = null;
 const sdk = () => (sdkPromise ||= import("@anthropic-ai/claude-agent-sdk"));
 
-const READ_ONLY = new Set(["Read", "Glob", "Grep", "LS", "NotebookRead", "TodoWrite", "Task", "Agent"]);
+const READ_ONLY = new Set(["Read", "Glob", "Grep", "LS", "NotebookRead", "TodoWrite", "Task", "Agent", "TaskCreate", "TaskGet", "TaskList", "TaskUpdate", "ToolSearch", "LSP", "EnterPlanMode"]);
 const EDIT_TOOLS = new Set(["Edit", "MultiEdit", "Write", "NotebookEdit"]);
 
-function lumenPrompt(workspace) {
-  return `You are running inside Lumen, a desktop code editor on the user's Mac. The folder open in the editor is ${workspace}. The user's home folder is ${os.homedir()}. The user wants help with anything on this computer, not only this folder: use absolute paths to read or search elsewhere when a question calls for it, starting narrow because whole-disk searches are slow. Messages may begin with an <editor_context> block describing the open file and selection. Edits and commands are approved by the user in Lumen's interface.`;
+const MODE_NOTES = {
+  ask: "This chat is in Ask mode: answer questions, explain and suggest, but do not change files. If the user wants something changed, describe the change and mention that switching the chat to Manual or Auto mode lets you apply it.",
+  manual: "",
+  "auto-edit": "This chat is in Auto-edit mode: your file edits are applied without a prompt, so review each one before making it. Commands still ask the user.",
+  auto: "This chat is in Auto mode: edits and ordinary commands run without a prompt (destructive or publishing commands still ask), so double-check paths and commands before using them.",
+  plan: "This chat is in Plan mode: investigate, then present a step-by-step plan and call ExitPlanMode. The user decides in Lumen whether to build it.",
+};
+
+function lumenPrompt(workspace, mode) {
+  return `You are running inside Lumen, a desktop code editor on the user's Mac. The folder open in the editor is ${workspace}. The user's home folder is ${os.homedir()}. The user wants help with anything on this computer, not only this folder: use absolute paths to read or search elsewhere when a question calls for it, starting narrow because whole-disk searches are slow. Messages may begin with an <editor_context> block describing the open file and selection. Edits and commands are approved by the user in Lumen's interface. The AskUserQuestion tool isn't available here: ask questions in plain text instead.${MODE_NOTES[mode] ? " " + MODE_NOTES[mode] : ""}`;
 }
 
 class ClaudeCodeAgent {
-  constructor({ getModel, getWorkspace, emit, requestApproval }) {
+  constructor({ getModel, getWorkspace, emit, requestApproval, beforeWrite, setMode }) {
+    this.beforeWrite = beforeWrite || (async () => {});
+    this.setMode = setMode || (() => {});
     this.getModel = getModel;
     this.getWorkspace = getWorkspace;
     this.emit = emit;
@@ -109,14 +120,37 @@ class ClaudeCodeAgent {
     this.sessionId = null;
     this.sessionCwd = null;
     this.controller = null;
+    this.query = null;
+    this.mode = "manual";
     this.alwaysAllow = new Set();
+    // Claude Code keeps the transcript; to undo a turn we resume from the message before it.
+    this.lastUuid = null;   // uuid of the last top-level assistant message so far
+    this.turnUuids = [];    // lastUuid as each user turn began (null = the session's start)
+    this.resumeAt = null;   // set by rewind(); used once on the next run
+    this.turnText = "";     // what Claude has said this turn (the plan, in Plan mode)
   }
 
   reset() {
     this.stop();
     this.sessionId = null;
     this.sessionCwd = null;
+    this.lastUuid = null;
+    this.turnUuids = [];
+    this.resumeAt = null;
     this.alwaysAllow.clear();
+  }
+
+  // Forget everything from user turn `turn` on (the user is going back to edit that message).
+  rewind(turn) {
+    if (turn === 0 || !this.turnUuids.length) { this.sessionId = null; this.sessionCwd = null; this.lastUuid = null; this.turnUuids = []; this.resumeAt = null; return true; }
+    if (turn > this.turnUuids.length) return false;
+    const at = this.turnUuids[turn];
+    if (at === undefined) return false;
+    if (at === null) { this.sessionId = null; this.sessionCwd = null; this.lastUuid = null; this.turnUuids = []; this.resumeAt = null; return true; }
+    this.resumeAt = at;
+    this.lastUuid = at;
+    this.turnUuids.length = turn;
+    return true;
   }
 
   stop() {
@@ -125,13 +159,16 @@ class ClaudeCodeAgent {
 
   // Claude Code keeps the conversation itself; resuming only needs its session id.
   snapshot() {
-    return { sessionId: this.sessionId, sessionCwd: this.sessionCwd };
+    return { sessionId: this.sessionId, sessionCwd: this.sessionCwd, lastUuid: this.lastUuid, turnUuids: this.turnUuids, resumeAt: this.resumeAt };
   }
 
   restore(state) {
     if (!state || !state.sessionId) return;
     this.sessionId = state.sessionId;
     this.sessionCwd = state.sessionCwd || null;
+    this.lastUuid = state.lastUuid || null;
+    this.turnUuids = Array.isArray(state.turnUuids) ? state.turnUuids : [];
+    this.resumeAt = state.resumeAt || null;
   }
 
   baseOptions(signalController) {
@@ -145,14 +182,17 @@ class ClaudeCodeAgent {
     };
   }
 
-  async run(userText) {
+  async run(userText, images = [], mode = "manual") {
+    this.mode = MODES.includes(mode) ? mode : "manual";
+    this.turnText = "";
     if (!claudePath()) {
       this.emit({ type: "error", message: "Claude Code isn't installed. Install it from claude.com/claude-code, then sign in." });
       return;
     }
     const { query } = await sdk();
     // A Claude Code session belongs to one folder; switching workspace starts a new one.
-    if (this.sessionCwd && this.sessionCwd !== this.getWorkspace()) this.sessionId = null;
+    if (this.sessionCwd && this.sessionCwd !== this.getWorkspace()) { this.sessionId = null; this.lastUuid = null; this.turnUuids = []; this.resumeAt = null; }
+    this.turnUuids.push(this.sessionId ? this.lastUuid : null);
     this.controller = new AbortController();
     const signal = this.controller.signal;
     const inputs = new Map(); // tool_use id → input, for file_changed events
@@ -160,10 +200,22 @@ class ClaudeCodeAgent {
     const options = {
       ...this.baseOptions(this.controller),
       includePartialMessages: true,
-      systemPrompt: { type: "preset", preset: "claude_code", append: lumenPrompt(this.getWorkspace()) },
-      permissionMode: "default",
+      systemPrompt: { type: "preset", preset: "claude_code", append: lumenPrompt(this.getWorkspace(), this.mode) },
+      permissionMode: this.mode === "plan" ? "plan" : "default",
       canUseTool: (toolName, input, opts) => this.canUseTool(toolName, input, opts),
-      ...(this.sessionId ? { resume: this.sessionId } : {}),
+      // Runs before every file edit, including ones the user's own permission rules allow
+      // without asking, so restore checkpoints see the file as it was.
+      hooks: {
+        PreToolUse: [{
+          matcher: "Write|Edit|MultiEdit|NotebookEdit",
+          hooks: [async (h) => {
+            const p = h.tool_input && (h.tool_input.file_path || h.tool_input.notebook_path);
+            if (p) await this.beforeWrite(path.resolve(this.getWorkspace(), p));
+            return { continue: true };
+          }],
+        }],
+      },
+      ...(this.sessionId ? { resume: this.sessionId, ...(this.resumeAt ? { resumeSessionAt: this.resumeAt } : {}) } : {}),
     };
 
     let sawText = false, failed = false;
@@ -181,9 +233,13 @@ class ClaudeCodeAgent {
       this.emit({ type: "error", message });
     };
     try {
-      for await (const msg of query({ prompt: userText, options })) {
-        if (msg.session_id) { this.sessionId = msg.session_id; this.sessionCwd = this.getWorkspace(); }
+      // Always streamed input: that's what lets the session's permission mode change mid-turn (Plan → build).
+      const q = query({ prompt: withImages(userText, images), options });
+      this.query = q;
+      for await (const msg of q) {
+        if (msg.session_id) { this.sessionId = msg.session_id; this.sessionCwd = this.getWorkspace(); this.resumeAt = null; }
         if (msg.parent_tool_use_id) continue; // subagent internals stay inside their tool card
+        if (msg.type === "assistant" && msg.uuid) this.lastUuid = msg.uuid;
 
         if (msg.type === "stream_event") {
           const ev = msg.event;
@@ -191,7 +247,7 @@ class ClaudeCodeAgent {
           else if (ev.type === "content_block_start" && ev.content_block.type === "tool_use") {
             this.emit({ type: "tool_pending", id: ev.content_block.id, name: ev.content_block.name });
           } else if (ev.type === "content_block_delta") {
-            if (ev.delta.type === "text_delta") { sawText = true; this.emit({ type: "text", delta: ev.delta.text }); }
+            if (ev.delta.type === "text_delta") { sawText = true; this.turnText += ev.delta.text; this.emit({ type: "text", delta: ev.delta.text }); }
             else if (ev.delta.type === "thinking_delta") this.emit({ type: "thinking", delta: ev.delta.thinking });
           }
         } else if (msg.type === "assistant") {
@@ -229,13 +285,24 @@ class ClaudeCodeAgent {
       else fail(friendly(err));
     } finally {
       this.controller = null;
+      this.query = null;
     }
   }
 
-  async canUseTool(toolName, input, { signal, suggestions, toolUseID, title }) {
-    if (READ_ONLY.has(toolName)) return { behavior: "allow", updatedInput: input };
-    const kind = EDIT_TOOLS.has(toolName) ? "edits" : toolName;
-    if (this.alwaysAllow.has(kind)) return { behavior: "allow", updatedInput: input };
+  async canUseTool(toolName, input, opts) {
+    const { signal, suggestions, toolUseID, title } = opts;
+    const allow = { behavior: "allow", updatedInput: input };
+    if (toolName === "ExitPlanMode") return this.exitPlan(input, opts);
+    if (toolName === "AskUserQuestion") return { behavior: "deny", message: "Lumen can't show structured questions. Ask the user in plain text in your reply instead." };
+    if (READ_ONLY.has(toolName)) return allow;
+    const isEdit = EDIT_TOOLS.has(toolName);
+    if (isEdit && (this.mode === "ask" || this.mode === "plan")) {
+      return { behavior: "deny", message: `This chat is in ${this.mode === "ask" ? "Ask" : "Plan"} mode, so files can't be changed. ${this.mode === "plan" ? "Describe this step in the plan and call ExitPlanMode when the plan is ready." : "Describe the change instead; the user can switch the chat to Manual or Auto mode to apply it."}` };
+    }
+    if (isEdit && (this.mode === "auto" || this.mode === "auto-edit")) return allow;
+    if (toolName === "Bash" && this.mode === "auto" && !risky(input.command)) return allow;
+    const kind = isEdit ? "edits" : toolName;
+    if (this.alwaysAllow.has(kind)) return allow;
 
     const preview = await this.preview(toolName, input, title);
     const id = toolUseID || `perm-${Date.now()}`;
@@ -248,6 +315,23 @@ class ClaudeCodeAgent {
       return { behavior: "allow", updatedInput: input, ...(suggestions ? { updatedPermissions: suggestions } : {}) };
     }
     return { behavior: "deny", message: decision === "cancel" ? "Cancelled by the user." : "The user declined this action.", interrupt: decision === "cancel" };
+  }
+
+  // Plan mode: Claude is done planning. The user chooses in the chat whether to build it,
+  // and in which mode; the session then leaves plan mode for the rest of this turn.
+  async exitPlan(input, { signal, toolUseID }) {
+    const plan = typeof input.plan === "string" && input.plan.trim() ? input.plan : this.turnText;
+    const id = toolUseID || `plan-${Date.now()}`;
+    const decision = await this.requestApproval({ id, name: "exit_plan", input: {}, preview: { kind: "plan", plan } }, signal);
+    if (decision === "allow" || decision === "auto") {
+      const next = decision === "auto" ? "auto" : "manual";
+      this.mode = next;
+      this.setMode(next);
+      try { if (this.query) await this.query.setPermissionMode(next === "auto" ? "acceptEdits" : "default"); } catch {}
+      this.emit({ type: "notice", text: `Building the plan in ${next === "auto" ? "Auto" : "Manual"} mode.` });
+      return { behavior: "allow", updatedInput: input };
+    }
+    return { behavior: "deny", message: decision === "cancel" ? "Cancelled by the user." : "The user wants to keep planning. Wait for their next message and revise the plan.", interrupt: decision === "cancel" };
   }
 
   async preview(toolName, input, title) {
@@ -293,11 +377,11 @@ Reply with only the replacement for the selected code, keeping its indentation s
   }
 
   // One tool-free turn outside the chat (⌘K, commit messages).
-  async complete(prompt) {
+  async complete(prompt, { model } = {}) {
     if (!claudePath()) throw new Error("Claude Code isn't installed.");
     const { query } = await sdk();
     let text = "";
-    for await (const msg of query({ prompt, options: { ...this.baseOptions(new AbortController()), tools: [], maxTurns: 1, persistSession: false, settingSources: [] } })) {
+    for await (const msg of query({ prompt, options: { ...this.baseOptions(new AbortController()), ...(model ? { model } : {}), tools: [], maxTurns: 1, persistSession: false, settingSources: [] } })) {
       if (msg.type === "result") {
         if (msg.subtype !== "success") throw new Error(resultError(msg));
         text = msg.result || "";
@@ -348,6 +432,13 @@ function friendly(err) {
   const m = err && err.message ? err.message : String(err);
   if (/ENOENT/.test(m)) return "Couldn't start Claude Code. Check that it's installed.";
   return explain(m) || m;
+}
+
+// Images can't go in a plain-text prompt, so the message is sent as one streamed user message.
+async function* withImages(text, images) {
+  const content = images.map((i) => ({ type: "image", source: { type: "base64", media_type: i.mime, data: i.data } }));
+  if (text) content.push({ type: "text", text });
+  yield { type: "user", message: { role: "user", content }, parent_tool_use_id: null };
 }
 
 module.exports = { ClaudeCodeAgent, authStatus, login, logout, claudePath };

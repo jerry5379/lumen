@@ -107,7 +107,27 @@ const TOOLS = [
 const REQUIRED = Object.fromEntries(TOOLS.map((t) => [t.name, t.input_schema.required]));
 const NEEDS_APPROVAL = new Set(["edit_file", "write_file", "run_command"]);
 
-function systemPrompt(workspace) {
+// Chat modes, like Cursor's: how much Claude may do without asking.
+//   ask       answer and explain; no file changes or commands
+//   manual    every edit and command is approved by the user (default)
+//   auto-edit edits are applied on their own; commands still ask
+//   auto      edits and commands run on their own, except commands that look destructive
+//   plan      explore and write a plan; nothing is changed until the user says build it
+const MODES = ["ask", "manual", "auto-edit", "auto", "plan"];
+// Commands that still ask for approval in Auto mode: deleting things, rewriting history,
+// publishing, anything that needs root, and the classic "pipe the internet into a shell".
+const DANGEROUS = /\brm\s+-[a-z]*[rf]|\brmdir\b|\bsudo\b|\bsu\b|\bgit\s+push\b|\bgit\s+(reset\s+--hard|clean\s+-[a-z]*f|checkout\s+--\s|restore\s+(--worktree|\.)|branch\s+-D|stash\s+(drop|clear)|rebase|filter-branch)\b|--force\b|-f\s+(origin|upstream)\b|\b(npm|pnpm|yarn|cargo|gem|twine)\s+publish\b|\bgh\s+(pr|release)\s+(create|merge|delete)|\bmkfs\b|\bdd\s+if=|\bdiskutil\b|\bshutdown\b|\breboot\b|\bkill(all)?\s+-9|\bpkill\b|\bchmod\s+-R\b|\bchown\s+-R\b|\b(drop|truncate)\s+(table|database|schema)\b|\bcurl\b[^|\n]*\|\s*(ba|z)?sh\b|\bwget\b[^|\n]*\|\s*(ba|z)?sh\b|>\s*\/dev\/(sd|disk)|:\(\)\s*\{|\bdocker\s+(system\s+prune|rm|rmi|volume\s+rm)|\bbrew\s+uninstall\b|\bpip\s+uninstall\b|\bnpm\s+(uninstall|rm)\s+-g\b|\bdefaults\s+(write|delete)\b|\blaunchctl\b|\bcrontab\b|\bosascript\b|\bsecurity\b|\bopen\s+-a\b/i;
+const risky = (command) => DANGEROUS.test(String(command || ""));
+
+const MODE_NOTES = {
+  ask: "This chat is in Ask mode: answer questions, explain and suggest, but do not change files or run commands. If the user wants something changed, describe the change (code blocks are fine) and mention that switching the chat to Manual or Auto mode lets you apply it.",
+  manual: "",
+  "auto-edit": "This chat is in Auto-edit mode: your file edits are applied without a prompt, so review each one yourself before making it. Commands still ask the user.",
+  auto: "This chat is in Auto mode: edits and ordinary commands run without a prompt (destructive or publishing commands still ask), so double-check paths and commands before using them.",
+  plan: "This chat is in Plan mode: investigate with the read-only tools, then reply with a clear step-by-step plan (files to change, what changes, how to verify) and stop. Do not edit files or run commands that change anything. The user will switch the mode when they want the plan carried out.",
+};
+
+function systemPrompt(workspace, mode) {
   return `You are Claude, the AI pair programmer inside Lumen, a desktop code editor on the user's Mac.
 
 You have tools that reach the user's whole computer, not just one project: you can list folders, find files, search contents, read files, edit and write files, and run shell commands. Nothing is preloaded into your context, so explore with tools whenever a question depends on what is on disk. Start narrow (the workspace, or the folder the user names) and widen only when needed; searching the entire disk is slow.
@@ -119,11 +139,12 @@ Relative paths resolve against the workspace; ~ means the home folder.
 
 Edits and commands are shown to the user for approval. If the user declines, accept that and continue or ask what they would prefer. Prefer edit_file for small changes to existing files. Never run destructive commands (rm -rf, disk formatting, force pushes) unless the user explicitly asked for exactly that.
 
-Be concise. Use fenced code blocks with a language tag when showing code. Refer to files by full path.`;
+Be concise. Use fenced code blocks with a language tag when showing code. Refer to files by full path.${MODE_NOTES[mode] ? "\n\n" + MODE_NOTES[mode] : ""}`;
 }
 
 class Agent {
-  constructor({ getApiKey, isSignedIn, getModel, getWorkspace, emit, requestApproval }) {
+  constructor({ getApiKey, isSignedIn, getModel, getWorkspace, emit, requestApproval, beforeWrite }) {
+    this.beforeWrite = beforeWrite || (async () => {});
     this.getApiKey = getApiKey;
     this.isSignedIn = isSignedIn;
     this.getModel = getModel;
@@ -131,6 +152,8 @@ class Agent {
     this.emit = emit;
     this.requestApproval = requestApproval;
     this.messages = [];
+    this.turnStarts = [];  // messages.length when each user turn began, so a turn can be undone
+    this.mode = "manual";
     this.alwaysAllow = new Set();
     this.controller = null;
   }
@@ -138,7 +161,17 @@ class Agent {
   reset() {
     this.stop();
     this.messages = [];
+    this.turnStarts = [];
     this.alwaysAllow.clear();
+  }
+
+  // Forget everything from user turn `turn` on (the user is going back to edit that message).
+  rewind(turn) {
+    const at = this.turnStarts[turn];
+    if (at == null) { if (turn === 0) { this.messages = []; this.turnStarts = []; return true; } return false; }
+    this.messages.length = Math.min(this.messages.length, at);
+    this.turnStarts.length = turn;
+    return true;
   }
 
   stop() {
@@ -147,12 +180,13 @@ class Agent {
 
   // Saved between launches so Claude remembers the chat. "Always allow" is not saved.
   snapshot() {
-    return { messages: this.messages };
+    return { messages: this.messages, turnStarts: this.turnStarts };
   }
 
   restore(state) {
     if (!state || !Array.isArray(state.messages)) return;
     this.messages = state.messages;
+    this.turnStarts = Array.isArray(state.turnStarts) ? state.turnStarts : [];
     // The app may have quit mid-turn.
     this.repairAfterAbort();
   }
@@ -175,7 +209,7 @@ class Agent {
     const params = {
       model,
       max_tokens: 64000,
-      system: systemPrompt(this.getWorkspace()),
+      system: systemPrompt(this.getWorkspace(), this.mode),
       tools: TOOLS,
       messages: this.messages,
       thinking: { type: "adaptive", display: "summarized" },
@@ -191,14 +225,16 @@ class Agent {
   }
 
   // One user message → as many model/tool rounds as Claude needs.
-  async run(userText) {
+  async run(userText, images = [], mode = "manual") {
+    this.mode = MODES.includes(mode) ? mode : "manual";
+    this.turnStarts.push(this.messages.length);
     let client;
     try { client = this.client(); }
     catch (err) { this.emit({ type: "error", message: err.message }); return; }
     const model = this.getModel();
     this.controller = new AbortController();
     const signal = this.controller.signal;
-    this.messages.push({ role: "user", content: userText });
+    this.messages.push({ role: "user", content: userContent(userText, images) });
     let jsonRetries = 0;
 
     try {
@@ -278,7 +314,7 @@ class Agent {
         });
       }
     }
-    if (last && last.role === "user" && typeof last.content === "string") {
+    if (last && last.role === "user" && (typeof last.content === "string" || !last.content.some((b) => b.type === "tool_result"))) {
       // The model never answered this message; drop it so the next turn starts clean.
       this.messages.pop();
     }
@@ -294,7 +330,12 @@ class Agent {
 
     this.emit({ type: "tool_start", id: tu.id, name: tu.name, input: summarizeInput(tu.name, input) });
     try {
-      if (NEEDS_APPROVAL.has(tu.name) && !this.alwaysAllow.has(tu.name)) {
+      if (NEEDS_APPROVAL.has(tu.name) && (this.mode === "ask" || this.mode === "plan")) {
+        return this.result(tu, `This chat is in ${this.mode === "ask" ? "Ask" : "Plan"} mode, so ${tu.name === "run_command" ? "commands can't be run" : "files can't be changed"}. ${this.mode === "plan" ? "Describe this step in your plan instead." : "Describe the change instead; the user can switch the chat to Manual or Auto mode to apply it."}`, true);
+      }
+      // Auto modes skip the prompt for edits, and Auto also for commands that look safe.
+      const auto = this.mode === "auto" ? !(tu.name === "run_command" && risky(input.command)) : this.mode === "auto-edit" ? tu.name !== "run_command" : false;
+      if (NEEDS_APPROVAL.has(tu.name) && !this.alwaysAllow.has(tu.name) && !auto) {
         const preview = await this.preview(tu.name, input);
         if (preview.error) return this.result(tu, preview.error, true);
         const decision = await this.requestApproval({ id: tu.id, name: tu.name, input: summarizeInput(tu.name, input), preview }, signal);
@@ -344,12 +385,14 @@ class Agent {
         const before = await fs.readFile(file, "utf8");
         const next = applyEdit(before, input);
         if (next.error) throw new Error(next.error);
+        await this.beforeWrite(file);
         await fs.writeFile(file, next.text);
         this.emit({ type: "file_changed", path: file });
         return `Edited ${file}`;
       }
       case "write_file": {
         const file = this.resolve(input.path);
+        await this.beforeWrite(file);
         await fs.mkdir(path.dirname(file), { recursive: true });
         await fs.writeFile(file, input.content);
         this.emit({ type: "file_changed", path: file });
@@ -387,10 +430,10 @@ Reply with only the replacement for the selected code, keeping its indentation s
   }
 
   // One call outside the chat, no tools (⌘K, commit messages).
-  async complete(prompt) {
+  async complete(prompt, { model } = {}) {
     const client = this.client();
     const msg = await client.messages.stream({
-      model: this.getModel(),
+      model: model || this.getModel(),
       max_tokens: 32000,
       output_config: { effort: "medium" },
       messages: [{ role: "user", content: prompt }],
@@ -512,4 +555,12 @@ function describeError(err) {
   return err.message || String(err);
 }
 
-module.exports = { Agent, describeError };
+// A user message: pasted images first, then the text.
+function userContent(text, images) {
+  if (!images || !images.length) return text;
+  const blocks = images.map((i) => ({ type: "image", source: { type: "base64", media_type: i.mime, data: i.data } }));
+  if (text) blocks.push({ type: "text", text });
+  return blocks;
+}
+
+module.exports = { Agent, describeError, MODES, risky };
